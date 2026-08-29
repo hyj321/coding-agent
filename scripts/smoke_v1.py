@@ -30,6 +30,8 @@ def main() -> None:
             "edit_file",
             "glob",
             "list_dir",
+            "memory_search",
+            "rag_search",
             "read_file",
             "run_shell",
             "todo_write",
@@ -140,7 +142,7 @@ def main() -> None:
         assert data["task"] == "hi"
 
         schemas = reg.openai_tools()
-        assert len(schemas) == 7
+        assert len(schemas) == 9
 
         todo_out = reg.dispatch(
             "todo_write",
@@ -251,12 +253,22 @@ def main() -> None:
         blob = "\n".join(str(m.get("content") or "") for m in prepared)
         assert "Current State" in blob or "Context Manager" in blob
         assert "Progressive Disclosure" in prepared[0]["content"]
+        # P1: working-memory note is a variable SUFFIX (last message)
+        assert prepared[-1]["role"] == "user"
+        assert "Context Manager" in str(prepared[-1].get("content") or "")
+        assert "prefix_stable" in str(prepared[-1].get("content") or "")
+        # System prompt cached / stable across prepares
+        p2 = ctx.prepare_messages(long_msgs, user_task="fix calculator")
+        assert p2[0]["content"] == prepared[0]["content"]
 
-        # --- P0 long/short memory: MEMORY.md + phase compress + continue slim ---
+        # --- P0/P1 long/short memory ---
         from src.agent.memory import (
             append_run_to_memory,
             load_memory_excerpt,
+            load_working_memory,
             resolve_memory_path,
+            save_working_memory,
+            search_memory_sources,
         )
 
         mem_path = append_run_to_memory(
@@ -276,6 +288,23 @@ def main() -> None:
         excerpt = load_memory_excerpt(root)
         assert "greeter.py" in excerpt
         assert "Hello" in excerpt or "Conclusion" in excerpt
+
+        wm = save_working_memory(
+            root,
+            {
+                "task": "fix greeter tests",
+                "focus_files": ["greeter.py"],
+                "history_summary": "edited greeter",
+                "todos_text": "",
+                "last_errors": [],
+                "actions": [],
+            },
+            transcript_dir=root / "transcripts",
+        )
+        assert wm is not None and wm.is_file()
+        loaded_wm = load_working_memory(root)
+        assert loaded_wm and loaded_wm.get("focus_files") == ["greeter.py"]
+        assert (root / "transcripts" / "working_memory.json").is_file()
 
         ctx2 = ContextManager(workdir=root, tool_names=reg.names(), token_budget=4000)
         assert ctx2.state.project_memory
@@ -310,6 +339,120 @@ def main() -> None:
         assert ctx3.state.phase_compress_events >= 1
         assert "Phase done" in ctx3.state.history_summary
         assert "todo 1" in ctx3.state.history_summary
+
+        # Fold → re-inject root state (MEMORY + focus + open todos)
+        ctx3.state.focus_files = ["greeter.py"]
+        folded = ctx3.prepare_messages(long_msgs, user_task="fix calculator")
+        folded_blob = "\n".join(str(m.get("content") or "") for m in folded)
+        assert ctx3.state.fold_events >= 1 or "Root State" in folded_blob or "Historical" in folded_blob
+        # Force fold path with tiny budget
+        ctx4 = ContextManager(
+            workdir=root,
+            tool_names=reg.names(),
+            token_budget=2000,
+            recent_keep_messages=6,
+        )
+        ctx4.state.focus_files = ["greeter.py"]
+        ctx4.state.todos_text = (
+            "Todo list:\n  [x] (1) read\n  [>] (2) fix\nProgress: 1/2 completed"
+        )
+        ctx4.reload_project_memory()
+        folded2 = ctx4.prepare_messages(long_msgs, user_task="fix calculator")
+        assert folded2[-1]["role"] == "user"
+        assert "Root State" in str(folded2[-1].get("content") or "")
+        assert "greeter.py" in str(folded2[-1].get("content") or "")
+        assert "(2)" in str(folded2[-1].get("content") or "")  # incomplete todo
+
+        # memory_search over MEMORY.md
+        found = search_memory_sources(workdir=root, query="greeter Hello", transcript_dir=None)
+        assert "greeter" in found.lower()
+        tool_found = reg.dispatch("memory_search", {"query": "greeter"})
+        assert "memory_search results" in tool_found or "greeter" in tool_found.lower()
+
+        # --- P2: RAG / MicroCompact / ACON guideline / cache policy ---
+        from src.agent.acon_guideline import load_guideline, record_failure_pair
+        from src.agent.cache_policy import build_cache_policy
+        from src.agent.compress import compress_tool_result, microcompact_messages, stub_tool_result
+        from src.agent.rag import build_rag_index, rag_search
+
+        stub = stub_tool_result("run_shell", "x" * 2000)
+        assert stub.startswith("[stub:run_shell")
+        summarized = compress_tool_result(
+            "run_shell",
+            pytest_log,
+            tier="summary",
+            soft_limit=800,
+        )
+        assert len(summarized) < len(pytest_log)
+        assert "failed" in summarized.lower() or "FAILED" in summarized
+
+        # MicroCompact stubs older tool messages
+        mc_msgs = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "t"},
+        ]
+        for i in range(8):
+            mc_msgs.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": f"m{i}",
+                            "type": "function",
+                            "function": {"name": "run_shell", "arguments": "{}"},
+                        }
+                    ],
+                }
+            )
+            mc_msgs.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": f"m{i}",
+                    "content": pytest_log,
+                }
+            )
+        compacted, n_stubs = microcompact_messages(mc_msgs, keep_recent_tools=2)
+        assert n_stubs >= 1
+        assert any(
+            isinstance(m.get("content"), str) and m["content"].startswith("[stub:")
+            for m in compacted
+            if m.get("role") == "tool"
+        )
+
+        # Context manager applies microcompact under budget pressure
+        ctx_mc = ContextManager(
+            workdir=root,
+            tool_names=reg.names(),
+            token_budget=3500,
+            recent_keep_messages=8,
+        )
+        prepared_mc = ctx_mc.prepare_messages(mc_msgs, user_task="t")
+        assert ctx_mc.state.microcompact_events >= 1 or any(
+            isinstance(m.get("content"), str) and "[stub:" in str(m.get("content"))
+            for m in prepared_mc
+        )
+
+        g0 = record_failure_pair(
+            root,
+            tool_name="run_shell",
+            observation_preview=("y" * 500) + "\nexit_code: 1\nFAILED tests/x.py",
+            recovered=False,
+        )
+        assert g0.get("updates", 0) >= 1
+        g1 = load_guideline(root)
+        assert "run_shell" in (g1.get("tool_limits") or {})
+
+        idx = build_rag_index(root, transcript_dir=root / "transcripts")
+        assert idx.get("n_docs", 0) >= 1
+        rag_hit = rag_search(root, "greeter hello", rebuild=False)
+        assert "rag_search" in rag_hit
+        rag_tool = reg.dispatch("rag_search", {"query": "greeter", "rebuild": True})
+        assert "rag_search" in rag_tool or "greeter" in rag_tool.lower()
+
+        pol = build_cache_policy(workdir=str(root), model="test-model")
+        assert pol.layout == "prefix_stable_suffix_variable"
+        assert pol.openai_extra_body() is not None
 
         # Continue slim: memory + recent K + original task (not full dump)
         tdir = root / "sessions"
@@ -366,7 +509,7 @@ def main() -> None:
         )
         assert len(slim) < len(big_messages)
 
-    print("smoke_v1: OK (ui-events+context+memory-p0)")
+    print("smoke_v1: OK (ui-events+context+memory-p0+p1+p2)")
 
 
 if __name__ == "__main__":

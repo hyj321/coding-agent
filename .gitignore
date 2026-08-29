@@ -17,6 +17,8 @@ build/
 .DS_Store
 transcripts/
 MEMORY.md
-.agent/MEMORY.md
+**/MEMORY.md
+.agent/
+**/.agent/
 *.log
 .python-version

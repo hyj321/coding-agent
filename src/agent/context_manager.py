@@ -1,17 +1,19 @@
 """ACON-inspired Context Manager for long-horizon coding agents.
 
+Prompt layout (P1 — cache-friendly):
+  STABLE PREFIX: system (rules + tools + frozen workspace snapshot) + original task
+  VARIABLE SUFFIX: Current State / Historical / root reinject note (appended at end)
+
 Five layers assembled into the model prompt (progressive disclosure):
-  1. System Context   — tools, workdir, rules (static-ish)
+  1. System Context   — tools, workdir, rules (stable within a run)
   2. Task Context     — original user goal
-  3. Current State    — focus files, todos, last errors
+  3. Current State    — focus files, todos, last errors, MEMORY.md
   4. Recent Actions   — last K tool turns (full-ish, already observation-compressed)
   5. Historical Context — summarized older turns (not raw dumps)
 
 Budget gate (chars≈tokens*4): when exceeded, fold older turns into Historical Context
 while keeping goal / state / recent actions — never naive head truncation only.
-
-We deliberately do NOT run ACON's offline failure-pair guideline optimizer; the
-compression guideline lives in compress.py as a fixed coding-agent policy.
+After fold, re-inject MEMORY + focus_files + incomplete todos from live state/disk.
 """
 
 from __future__ import annotations
@@ -21,15 +23,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from src.agent.acon_guideline import (
+    limits_for_tool,
+    load_guideline,
+    record_failure_pair,
+)
 from src.agent.compress import (
     compress_tool_result,
     estimate_messages_tokens,
-    estimate_tokens,
     extract_paths_from_args,
+    microcompact_messages,
     related_test_paths,
 )
 from src.agent.memory import format_memory_section, load_memory_excerpt
 from src.tools.filesystem import snapshot_workdir
+
+CONTEXT_NOTE_MARKER = "[Context Manager — layered working memory]"
+ROOT_REINJECT_MARKER = "[Root State — re-injected after context fold]"
 
 
 @dataclass
@@ -53,6 +63,12 @@ class ContextState:
     compress_events: int = 0
     project_memory: str = ""
     phase_compress_events: int = 0
+    fold_events: int = 0
+    microcompact_events: int = 0
+    guideline_updates: int = 0
+    layout_mode: str = "prefix_stable_suffix_variable"
+    last_failed_tool: str | None = None
+    last_failed_preview: str = ""
 
     def note_path(self, path: str | None) -> None:
         if not path:
@@ -137,6 +153,8 @@ class ContextManager:
         self.observation_soft_chars = observation_soft_chars
         self.observation_hard_chars = observation_hard_chars
         self.state = ContextState()
+        self._system_prompt_cache: str | None = None
+        self._guideline = load_guideline(self.workdir)
         self.reload_project_memory()
 
     def reload_project_memory(self, *, max_chars: int = 3000) -> None:
@@ -144,7 +162,7 @@ class ContextManager:
         self.state.project_memory = load_memory_excerpt(self.workdir, max_chars=max_chars)
 
     def import_memory(self, snapshot: dict[str, Any] | None) -> None:
-        """Hydrate working memory from a prior session export (Web continue)."""
+        """Hydrate working memory from a prior session / working_memory.json export."""
         if not snapshot:
             return
         self.state.task = str(snapshot.get("task") or self.state.task)
@@ -175,9 +193,12 @@ class ContextManager:
                 self.state.actions = restored
 
     def build_system_prompt(self) -> str:
+        """Stable within a run — cached so prompt-prefix bytes do not churn each step."""
+        if self._system_prompt_cache is not None:
+            return self._system_prompt_cache
         snapshot = snapshot_workdir(self.workdir)
         tools_line = ", ".join(self.tool_names)
-        return f"""You are a coding agent running on the user's machine.
+        self._system_prompt_cache = f"""You are a coding agent running on the user's machine.
 You solve programming tasks by calling tools.
 
 ## System Context
@@ -193,6 +214,8 @@ You solve programming tasks by calling tools.
 9. On tool errors, adjust approach briefly and retry.
 10. Project Memory (MEMORY.md) may appear under Current State — treat it as
     durable cross-run notes (conventions / past pitfalls); do not ignore it.
+11. Use memory_search for keyword recall; rag_search for local TF–IDF semantic recall.
+12. Prompt layout: system+task are a stable prefix; working memory is a variable suffix.
 
 ## Progressive Disclosure
 - Do NOT paste entire files into your reasoning.
@@ -200,9 +223,10 @@ You solve programming tasks by calling tools.
 - Call read_file only for the slice you need; prefer focused edits.
 - Relevant files are hinted in Current State — prioritize those over the whole repo.
 
-## Workspace snapshot (top-level only)
+## Workspace snapshot (top-level only; frozen at run start)
 {snapshot}
 """
+        return self._system_prompt_cache
 
     def observe_tool(
         self,
@@ -213,11 +237,16 @@ You solve programming tasks by calling tools.
         result: str,
     ) -> str:
         """Compress observation, update state, return text to store in messages."""
+        soft, hard, stub = limits_for_tool(self._guideline, tool_name)
+        soft = min(soft, self.observation_soft_chars)
+        hard = min(hard, self.observation_hard_chars)
         compressed = compress_tool_result(
             tool_name,
             result,
-            soft_limit=self.observation_soft_chars,
-            hard_limit=self.observation_hard_chars,
+            soft_limit=soft,
+            hard_limit=hard,
+            stub_limit=stub,
+            tier="full",
         )
         if compressed != result:
             self.state.compress_events += 1
@@ -227,9 +256,31 @@ You solve programming tasks by calling tools.
             self.state.note_path(p)
 
         ok = not str(result).startswith("Error")
-        if not ok or "failed" in compressed.lower() or "Error" in compressed:
-            # Prefer compressed failure card for state
+        failedish = (not ok) or bool(
+            re.search(r"(?m)^(FAILED|ERROR)\b|exit_code:\s*[1-9]", compressed)
+        )
+        if failedish:
             self.state.note_error(compressed.splitlines()[0] if compressed else result[:200])
+            self.state.last_failed_tool = tool_name
+            self.state.last_failed_preview = compressed[:400]
+            self._guideline = record_failure_pair(
+                self.workdir,
+                tool_name=tool_name,
+                observation_preview=compressed,
+                recovered=False,
+            )
+            self.state.guideline_updates = int(self._guideline.get("updates") or 0)
+        elif self.state.last_failed_tool:
+            # Recovered after a failure — record positive pair, clear latch
+            self._guideline = record_failure_pair(
+                self.workdir,
+                tool_name=self.state.last_failed_tool,
+                observation_preview=self.state.last_failed_preview,
+                recovered=True,
+            )
+            self.state.guideline_updates = int(self._guideline.get("updates") or 0)
+            self.state.last_failed_tool = None
+            self.state.last_failed_preview = ""
 
         summary = compressed.replace("\n", " ")
         if len(summary) > 160:
@@ -319,76 +370,124 @@ You solve programming tasks by calling tools.
         *,
         user_task: str,
     ) -> list[dict[str, Any]]:
-        """Return a budget-aware copy of messages with 5-layer context notes."""
+        """Budget-aware copy: stable system prefix + variable working-memory suffix."""
         self.state.task = user_task or self.state.task
         prepared = [dict(m) for m in messages]
 
-        # Ensure system is layered prompt (caller usually already set this)
+        # Stable prefix: cached system prompt (bytes fixed for this run)
         if prepared and prepared[0].get("role") == "system":
             prepared[0] = {
                 "role": "system",
                 "content": self.build_system_prompt(),
             }
 
-        # Inject / refresh ephemeral state + history as a user note after task head
+        # Variable suffix: strip old notes then append fresh state at the END
         state_note = self._state_note()
         prepared = self._upsert_context_note(prepared, state_note)
 
         tokens = estimate_messages_tokens(prepared)
+        # MicroCompact (P2): stub old tool payloads before expensive full fold
+        micro_gate = int(self.token_budget * 0.75)
+        if tokens > micro_gate:
+            bare = self._strip_ephemeral_notes(prepared)
+            keep = int(self._guideline.get("microcompact_keep_recent_tools") or 4)
+            stub_lim = int(self._guideline.get("stub_limit") or 180)
+            compacted, n_stubs = microcompact_messages(
+                bare,
+                keep_recent_tools=keep,
+                stub_limit=stub_lim,
+            )
+            if n_stubs:
+                self.state.microcompact_events += n_stubs
+                prepared = self._upsert_context_note(compacted, self._state_note())
+                tokens = estimate_messages_tokens(prepared)
+
         if tokens <= self.token_budget:
             return prepared
 
-        # Over budget → fold middle into Historical Context (keep head + recent tail)
         return self._fold_history(prepared, tokens)
 
-    def _state_note(self) -> str:
+    def _strip_ephemeral_notes(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for m in messages:
+            content = m.get("content")
+            if m.get("role") == "user" and isinstance(content, str):
+                if content.startswith(CONTEXT_NOTE_MARKER):
+                    continue
+                if content.startswith(ROOT_REINJECT_MARKER):
+                    continue
+                if content.startswith("[system note] Context folded"):
+                    continue
+            out.append(m)
+        return out
+
+    def _state_note(self, *, after_fold: bool = False) -> str:
         parts = [
-            "[Context Manager — layered working memory]",
+            CONTEXT_NOTE_MARKER,
             self.state.render_current_state(),
         ]
         hist = self.state.render_history()
         if hist:
             parts.append(hist)
+        if after_fold:
+            root = self._root_state_block()
+            if root:
+                parts.append(root)
         parts.append(
-            f"(budget ≈ {self.token_budget} tokens; "
+            f"(layout={self.state.layout_mode}; budget ≈ {self.token_budget} tokens; "
             f"observation compressions: {self.state.compress_events}; "
-            f"phase compressions: {self.state.phase_compress_events})"
+            f"phase compressions: {self.state.phase_compress_events}; "
+            f"microcompacts: {self.state.microcompact_events}; "
+            f"folds: {self.state.fold_events}; "
+            f"guideline_updates: {self.state.guideline_updates})"
         )
         return "\n\n".join(parts)
+
+    def _root_state_block(self) -> str:
+        """Force re-injection of MEMORY + focus + open todos after a fold."""
+        lines = [ROOT_REINJECT_MARKER, "## Root State (authoritative after fold)"]
+        if self.state.focus_files:
+            lines.append("Focus files:")
+            for f in self.state.focus_files:
+                lines.append(f"- {f}")
+        open_todos = _open_todo_lines(self.state.todos_text)
+        if open_todos:
+            lines.append("Incomplete todos:")
+            lines.extend(open_todos)
+        elif self.state.todos_text:
+            lines.append("Todos: (all completed or none open)")
+        mem = format_memory_section(self.state.project_memory)
+        if mem:
+            lines.append(mem)
+        if len(lines) <= 2:
+            return ""
+        return "\n".join(lines)
+
+    def _reinject_root_state(self) -> None:
+        """Reload durable MEMORY.md from disk into live state before suffix render."""
+        self.reload_project_memory()
+        self.state.fold_events += 1
 
     def _upsert_context_note(
         self,
         messages: list[dict[str, Any]],
         note: str,
     ) -> list[dict[str, Any]]:
-        """Place state note after system + first user task."""
-        marker = "[Context Manager — layered working memory]"
+        """Place working-memory note as VARIABLE SUFFIX (end of list), not mid-prefix."""
         out: list[dict[str, Any]] = []
-        inserted = False
-        for i, m in enumerate(messages):
+        for m in messages:
             content = m.get("content")
-            if (
-                m.get("role") == "user"
-                and isinstance(content, str)
-                and content.startswith(marker)
-            ):
-                continue  # drop old note; reinsert fresh
+            if m.get("role") == "user" and isinstance(content, str):
+                if content.startswith(CONTEXT_NOTE_MARKER):
+                    continue
+                if content.startswith(ROOT_REINJECT_MARKER):
+                    continue
+                if content.startswith("[system note] Context folded"):
+                    continue
             out.append(m)
-            if (
-                not inserted
-                and i >= 1
-                and m.get("role") == "user"
-                and not (isinstance(content, str) and content.startswith(marker))
-            ):
-                # after first real user task
-                out.append({"role": "user", "content": note})
-                inserted = True
-        if not inserted:
-            # system-only edge case
-            if out and out[0].get("role") == "system":
-                out.insert(1, {"role": "user", "content": note})
-            else:
-                out.insert(0, {"role": "user", "content": note})
+        out.append({"role": "user", "content": note})
         return out
 
     def _fold_history(
@@ -396,24 +495,35 @@ You solve programming tasks by calling tools.
         messages: list[dict[str, Any]],
         tokens_before: int,
     ) -> list[dict[str, Any]]:
-        """Keep system + task + context note + recent tail; summarize the rest."""
-        if len(messages) <= self.recent_keep_messages + 3:
-            return self._shrink_tool_payloads(messages)
+        """Keep system + task + recent tail; summarize the rest; re-inject root state."""
+        # Strip suffix notes before measuring head/tail
+        bare = [
+            m
+            for m in messages
+            if not (
+                m.get("role") == "user"
+                and isinstance(m.get("content"), str)
+                and (
+                    m["content"].startswith(CONTEXT_NOTE_MARKER)
+                    or m["content"].startswith(ROOT_REINJECT_MARKER)
+                    or m["content"].startswith("[system note] Context folded")
+                )
+            )
+        ]
+        if len(bare) <= self.recent_keep_messages + 3:
+            self._reinject_root_state()
+            return self._upsert_context_note(
+                self._shrink_tool_payloads(bare),
+                self._state_note(after_fold=True),
+            )
 
         head: list[dict[str, Any]] = []
         idx = 0
-        if messages and messages[0].get("role") == "system":
-            head.append(messages[0])
+        if bare and bare[0].get("role") == "system":
+            head.append(bare[0])
             idx = 1
-        # first user task (skip old context notes)
-        while idx < len(messages):
-            m = messages[idx]
-            c = m.get("content")
-            if m.get("role") == "user" and isinstance(c, str) and c.startswith(
-                "[Context Manager"
-            ):
-                idx += 1
-                continue
+        while idx < len(bare):
+            m = bare[idx]
             if m.get("role") == "user":
                 head.append(m)
                 idx += 1
@@ -421,27 +531,27 @@ You solve programming tasks by calling tools.
             break
 
         tail_budget = self.recent_keep_messages
-        tail = messages[-tail_budget:]
+        tail = bare[-tail_budget:]
         while tail and tail[0].get("role") == "tool":
-            # expand one message back if possible
-            start = len(messages) - len(tail) - 1
+            start = len(bare) - len(tail) - 1
             if start < idx:
                 tail = tail[1:]
                 break
-            tail = messages[start:]
+            tail = bare[start:]
             if tail[0].get("role") != "tool":
                 break
 
-        mid_end = len(messages) - len(tail)
-        middle = messages[idx:mid_end] if mid_end > idx else []
+        mid_end = len(bare) - len(tail)
+        middle = bare[idx:mid_end] if mid_end > idx else []
         if middle:
             summary = self._summarize_message_slice(middle)
             self.state.history_summary = self._merge_summary(self.state.history_summary, summary)
 
-        marker = "[Context Manager — layered working memory]"
+        # P1: re-inject MEMORY + focus + incomplete todos from disk/live state
+        self._reinject_root_state()
+
         cleaned: list[dict[str, Any]] = []
         cleaned.extend(head)
-        cleaned.append({"role": "user", "content": self._state_note()})
         cleaned.append(
             {
                 "role": "user",
@@ -449,17 +559,13 @@ You solve programming tasks by calling tools.
                     f"[system note] Context folded by Context Manager "
                     f"(≈{tokens_before} → budget {self.token_budget} tokens). "
                     "Older tool transcripts live in Historical Context; "
-                    "re-read files if you need exact contents."
+                    "Root State below was re-injected — trust it over the summary."
                 ),
             }
         )
         for m in tail:
-            c = m.get("content")
-            if m.get("role") == "user" and isinstance(c, str) and c.startswith(marker):
-                continue
-            if m.get("role") == "user" and isinstance(c, str) and c.startswith("[system note]"):
-                continue
             cleaned.append(m)
+        cleaned.append({"role": "user", "content": self._state_note(after_fold=True)})
 
         if estimate_messages_tokens(cleaned) > self.token_budget:
             cleaned = self._shrink_tool_payloads(cleaned)
@@ -546,6 +652,10 @@ You solve programming tasks by calling tools.
             "todos_text": self.state.todos_text,
             "compress_events": self.state.compress_events,
             "phase_compress_events": self.state.phase_compress_events,
+            "fold_events": self.state.fold_events,
+            "microcompact_events": self.state.microcompact_events,
+            "guideline_updates": self.state.guideline_updates,
+            "layout_mode": self.state.layout_mode,
             "has_project_memory": bool(self.state.project_memory),
             "actions": [
                 {
@@ -584,6 +694,22 @@ def _parse_todo_status_map(todos_text: str) -> dict[str, str]:
         }.get(mark, "pending")
         out[item_id] = status
     return out
+
+
+def _open_todo_lines(todos_text: str) -> list[str]:
+    """Lines for incomplete todos only (pending / in_progress)."""
+    lines: list[str] = []
+    if not todos_text:
+        return lines
+    for line in todos_text.splitlines():
+        m = re.match(r"\s*\[([ >\-])\]\s*\(([^)]+)\)\s*(.+)$", line)
+        if not m:
+            continue
+        mark, item_id, content = m.group(1), m.group(2), m.group(3).strip()
+        status = {" ": "pending", ">": "in_progress", "-": "cancelled"}.get(mark)
+        if status in {"pending", "in_progress"}:
+            lines.append(f"- ({item_id}) [{status}] {content}")
+    return lines
 
 
 def _phase_bullets(actions: list[ActionRecord], *, limit: int = 5) -> list[str]:

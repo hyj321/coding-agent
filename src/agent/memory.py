@@ -1,11 +1,13 @@
 """Project-level long-term memory via MEMORY.md (MemGPT-style editable block).
 
-Short-term / working memory stays in ContextManager; this file is the archival
-layer that persists across runs and is re-injected at the start of a new task.
+Short-term / working memory stays in ContextManager + working_memory.json;
+MEMORY.md is the archival layer that persists across runs.
 """
 
 from __future__ import annotations
 
+import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,8 @@ Newest entries are at the bottom; the agent prefers the recent tail on load.
 ---
 """
 
+WORKING_MEMORY_NAME = "working_memory.json"
+
 
 def resolve_memory_path(workdir: Path) -> Path:
     """Prefer an existing MEMORY.md / .agent/MEMORY.md; else default to workdir/MEMORY.md."""
@@ -32,6 +36,11 @@ def resolve_memory_path(workdir: Path) -> Path:
     if agent_dir.is_dir():
         return agent_dir / "MEMORY.md"
     return root / "MEMORY.md"
+
+
+def working_memory_path(workdir: Path) -> Path:
+    """Raschka dual-track: small working snapshot beside the workdir (not full transcript)."""
+    return workdir.resolve() / ".agent" / WORKING_MEMORY_NAME
 
 
 def load_memory_excerpt(workdir: Path, *, max_chars: int = 3000) -> str:
@@ -60,6 +69,47 @@ def format_memory_section(excerpt: str) -> str:
     if not excerpt.strip():
         return ""
     return "## Project Memory (from MEMORY.md)\n" + excerpt.strip()
+
+
+def save_working_memory(
+    workdir: Path,
+    snapshot: dict[str, Any] | None,
+    *,
+    transcript_dir: Path | None = None,
+) -> Path | None:
+    """Persist a compact working-memory snapshot (dual-track with full transcript)."""
+    if not snapshot:
+        return None
+    payload = {
+        "updated_at": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+        "workdir": str(workdir.resolve()),
+        **snapshot,
+    }
+    path = working_memory_path(workdir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        return None
+    if transcript_dir is not None:
+        try:
+            transcript_dir.mkdir(parents=True, exist_ok=True)
+            twin = transcript_dir / WORKING_MEMORY_NAME
+            twin.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+    return path
+
+
+def load_working_memory(workdir: Path) -> dict[str, Any] | None:
+    path = working_memory_path(workdir)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def append_run_to_memory(
@@ -104,7 +154,6 @@ def append_run_to_memory(
     if summary:
         lines.append(f"- **Conclusion:** {summary}")
     if todos:
-        # Keep todo block compact
         todo_flat = todos.replace("\n", " | ")
         if len(todo_flat) > 280:
             todo_flat = todo_flat[:277] + "…"
@@ -133,3 +182,114 @@ def append_run_to_memory(
     except OSError:
         return None
     return path
+
+
+def search_memory_sources(
+    *,
+    workdir: Path,
+    query: str,
+    transcript_dir: Path | None = None,
+    max_hits: int = 12,
+    max_snippet: int = 220,
+) -> str:
+    """Keyword search over MEMORY.md + transcripts (no embeddings)."""
+    q = (query or "").strip()
+    if not q:
+        return "Error: 'query' is required"
+    terms = [t for t in re.split(r"\s+", q.lower()) if t]
+    if not terms:
+        return "Error: empty query"
+
+    hits: list[tuple[int, str, str]] = []
+
+    mem_path = resolve_memory_path(workdir)
+    if mem_path.is_file():
+        try:
+            text = mem_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            text = ""
+        for block in _split_memory_blocks(text):
+            score = _keyword_score(block, terms)
+            if score > 0:
+                hits.append((score, f"MEMORY.md:{mem_path.name}", _clip(block, max_snippet)))
+
+    roots: list[Path] = []
+    if transcript_dir is not None and transcript_dir.is_dir():
+        roots.append(transcript_dir.resolve())
+    default_t = Path("transcripts").resolve()
+    if default_t.is_dir() and default_t not in roots:
+        roots.append(default_t)
+
+    seen_files: set[Path] = set()
+    for root in roots:
+        for path in sorted(root.glob("session_*.json")) + sorted(root.glob("run_*.json")):
+            if path in seen_files:
+                continue
+            seen_files.add(path)
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            for label, chunk in _transcript_search_chunks(data):
+                score = _keyword_score(chunk, terms)
+                if score > 0:
+                    hits.append((score, f"{path.name}:{label}", _clip(chunk, max_snippet)))
+
+    if not hits:
+        return f"No matches for {q!r} in MEMORY.md / transcripts."
+
+    hits.sort(key=lambda h: (-h[0], h[1]))
+    lines = [f"memory_search results for {q!r} (top {min(max_hits, len(hits))}):"]
+    for score, source, snippet in hits[:max_hits]:
+        lines.append(f"- [{score}] {source}")
+        lines.append(f"  {snippet.replace(chr(10), ' / ')}")
+    return "\n".join(lines)
+
+
+def _split_memory_blocks(text: str) -> list[str]:
+    if not text.strip():
+        return []
+    parts = re.split(r"(?m)(?=^## )", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _transcript_search_chunks(data: dict[str, Any]) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    task = str(data.get("task") or "")
+    if task:
+        out.append(("task", task))
+    final = str(data.get("final_text") or "")
+    if final:
+        out.append(("final", final))
+    mem = data.get("memory")
+    if isinstance(mem, dict):
+        for key in ("history_summary", "todos_text", "focus_files", "last_errors"):
+            val = mem.get(key)
+            if val:
+                out.append((f"memory.{key}", str(val)))
+    for i, turn in enumerate(data.get("turns") or []):
+        if not isinstance(turn, dict):
+            continue
+        ttask = str(turn.get("task") or "")
+        tfinal = str(turn.get("final_text") or "")
+        if ttask:
+            out.append((f"turn{i}.task", ttask))
+        if tfinal:
+            out.append((f"turn{i}.final", tfinal))
+    return out
+
+
+def _keyword_score(text: str, terms: list[str]) -> int:
+    low = text.lower()
+    score = 0
+    for t in terms:
+        if t in low:
+            score += 1 + low.count(t)
+    return score
+
+
+def _clip(text: str, limit: int) -> str:
+    flat = " ".join(text.split())
+    if len(flat) <= limit:
+        return flat
+    return flat[: limit - 1] + "…"

@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 from src.agent.context import ContextManager, trim_messages
-from src.agent.memory import append_run_to_memory
+from src.agent.memory import append_run_to_memory, load_working_memory, save_working_memory
 from src.agent.permissions import PermissionGate
 from src.llm.client import LLMClient
 from src.tools.base import ToolRegistry
@@ -136,6 +137,7 @@ def run_agent(
     context_token_budget: int | None = None,
     context_manager: ContextManager | None = None,
     persist_memory_md: bool = True,
+    transcript_dir: Path | None = None,
 ) -> AgentResult:
     """Core harness loop with ACON-inspired Context Manager.
 
@@ -166,6 +168,16 @@ def run_agent(
 
     if ctx is not None and prior_memory:
         ctx.import_memory(prior_memory)
+    elif ctx is not None and workdir is not None and not prior_messages:
+        # New run: hydrate from dual-track working_memory.json if present
+        disk_wm = load_working_memory(workdir)
+        if disk_wm:
+            ctx.import_memory(disk_wm)
+            log("[agent] hydrated working memory from .agent/working_memory.json")
+
+    tdir = transcript_dir
+    if tdir is None:
+        tdir = getattr(client.config, "transcript_dir", None)
 
     if prior_messages:
         messages = [m for m in prior_messages if m.get("role") != "system"]
@@ -190,6 +202,10 @@ def run_agent(
             log("[agent] loaded Project Memory from MEMORY.md")
         if prior_memory:
             log("[agent] hydrated working memory from prior session snapshot")
+        log(f"[agent] prompt_layout={ctx.state.layout_mode}")
+    cache_pol = getattr(client, "cache_policy", None)
+    if cache_pol is not None:
+        log(f"[agent] {cache_pol.describe()}")
     log(f"[agent] task={user_task!r}")
     emit(
         {
@@ -200,10 +216,20 @@ def run_agent(
             "task": user_task,
             "context_token_budget": ctx.token_budget if ctx is not None else None,
             "has_project_memory": bool(ctx and ctx.state.project_memory),
+            "prompt_layout": ctx.state.layout_mode if ctx is not None else None,
         }
     )
 
     def _finish(result: AgentResult) -> AgentResult:
+        if ctx is not None and workdir is not None and result.memory is not None:
+            wm_path = save_working_memory(
+                workdir,
+                result.memory,
+                transcript_dir=tdir if isinstance(tdir, Path) else None,
+            )
+            if wm_path is not None:
+                log(f"[memory] working_memory → {wm_path}")
+                emit({"type": "working_memory_write", "path": str(wm_path)})
         if persist_memory_md and ctx is not None and workdir is not None:
             mem_path = append_run_to_memory(
                 workdir,

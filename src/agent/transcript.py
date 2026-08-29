@@ -164,6 +164,7 @@ def append_session_file_changes(
 
 _CONTEXT_MARKERS = (
     "[Context Manager — layered working memory]",
+    "[Root State — re-injected after context fold]",
     "[system note]",
     "[Session memory",
 )

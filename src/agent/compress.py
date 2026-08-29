@@ -1,17 +1,25 @@
 """Observation compression — ACON-style tool-result condensations (rule-based).
 
 Inspired by ACON (Kang et al.): compress environment observations aggressively
-while preserving failure signals agents need to recover. We use a fixed
-natural-language compression *guideline* (no offline failure-pair optimizer).
+while preserving failure signals agents need to recover.
+
+Tiers (MicroCompact-style, P2):
+  stub     — one-line placeholder for old / huge payloads
+  summary  — failure card / head+tail extract
+  full     — soft/hard clip of structured compression (default on ingest)
+
+Guideline soft/hard limits can be tightened from failure pairs
+(see acon_guideline.py) — no offline distilled compressor.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Literal
 
+CompressTier = Literal["stub", "summary", "full"]
 
-# --- Compression guideline (static; ACON would refine this from failures) ---
+# --- Default compression guideline (ACON would refine this from failures) ---
 #
 # KEEP: exit codes, FAILED/ERROR test names, exception types + short messages,
 #       file paths touched, todo list text, short edit confirmations.
@@ -64,12 +72,27 @@ def estimate_messages_tokens(messages: list[dict[str, Any]]) -> int:
     return total
 
 
+def stub_tool_result(tool_name: str, result: str, *, limit: int = 180) -> str:
+    """MicroCompact tier-1: replace a large tool payload with a one-line stub."""
+    flat = " ".join((result or "").split())
+    ok = not (result or "").startswith("Error")
+    mark = "ok" if ok else "ERR"
+    if "failed" in flat.lower() or "Error" in (result or "")[:80]:
+        mark = "ERR"
+    preview = flat[: max(40, limit - 40)]
+    if len(flat) > len(preview):
+        preview += "…"
+    return f"[stub:{tool_name}|{mark}|{len(result or 0)}c] {preview}"
+
+
 def compress_tool_result(
     tool_name: str,
     result: str,
     *,
     soft_limit: int = 1200,
     hard_limit: int = 2400,
+    tier: CompressTier = "full",
+    stub_limit: int = 180,
 ) -> str:
     """Compress a tool observation before it enters the agent message list.
 
@@ -77,20 +100,28 @@ def compress_tool_result(
     """
     if not result:
         return result
+
+    if tier == "stub":
+        return stub_tool_result(tool_name, result, limit=stub_limit)
+
     if result.startswith("Error:"):
-        return _clip(result, hard_limit)
+        return _clip(result, hard_limit if tier == "full" else min(hard_limit, soft_limit))
 
     name = (tool_name or "").lower()
     if name == "run_shell":
         compressed = _compress_shell(result)
     elif name == "todo_write":
         return result  # already compact checklist
-    elif name in {"read_file", "list_dir", "glob"}:
+    elif name in {"read_file", "list_dir", "glob", "memory_search", "rag_search"}:
         compressed = _compress_readish(result, soft_limit)
     elif name in {"write_file", "edit_file"}:
         return _clip(result, soft_limit)
     else:
         compressed = result
+
+    if tier == "summary":
+        extracted = _extract_failures(compressed) or compressed
+        return _clip(extracted, min(soft_limit, 800))
 
     if len(compressed) <= soft_limit:
         return compressed
@@ -99,6 +130,62 @@ def compress_tool_result(
     if extracted and len(extracted) < len(compressed):
         compressed = extracted
     return _clip(compressed, hard_limit)
+
+
+def microcompact_messages(
+    messages: list[dict[str, Any]],
+    *,
+    keep_recent_tools: int = 4,
+    stub_limit: int = 180,
+    min_chars_to_stub: int = 400,
+) -> tuple[list[dict[str, Any]], int]:
+    """Stub older tool results in-place (copy); returns (messages, stub_count).
+
+    Keeps the last `keep_recent_tools` tool messages intact; older bulky ones
+    become one-line stubs — Claude-Code-style MicroCompact before full fold.
+    """
+    tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    if len(tool_indices) <= keep_recent_tools:
+        return [dict(m) for m in messages], 0
+
+    protect = set(tool_indices[-keep_recent_tools:])
+    out: list[dict[str, Any]] = []
+    stubs = 0
+    for i, m in enumerate(messages):
+        if i in protect or m.get("role") != "tool":
+            out.append(dict(m))
+            continue
+        content = m.get("content")
+        if not isinstance(content, str) or len(content) < min_chars_to_stub:
+            out.append(dict(m))
+            continue
+        if content.startswith("[stub:"):
+            out.append(dict(m))
+            continue
+        # Best-effort tool name from preceding assistant tool_calls
+        name = _tool_name_for_index(messages, i) or "tool"
+        out.append({**m, "content": stub_tool_result(name, content, limit=stub_limit)})
+        stubs += 1
+    return out, stubs
+
+
+def _tool_name_for_index(messages: list[dict[str, Any]], tool_index: int) -> str | None:
+    call_id = messages[tool_index].get("tool_call_id")
+    for j in range(tool_index - 1, -1, -1):
+        m = messages[j]
+        if m.get("role") != "assistant":
+            continue
+        for tc in m.get("tool_calls") or []:
+            if call_id and tc.get("id") == call_id:
+                fn = tc.get("function") or {}
+                return str(fn.get("name") or "tool")
+        # fall back to first tool call name on that assistant turn
+        tcs = m.get("tool_calls") or []
+        if tcs:
+            fn = tcs[0].get("function") or {}
+            return str(fn.get("name") or "tool")
+        break
+    return None
 
 
 def _clip(text: str, limit: int) -> str:

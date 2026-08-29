@@ -95,7 +95,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     gate = PermissionGate(config.workdir, approval=config.approval)
-    registry = build_default_registry(gate, max_output_chars=config.max_tool_output_chars)
+    registry = build_default_registry(
+        gate,
+        max_output_chars=config.max_tool_output_chars,
+        transcript_dir=config.transcript_dir,
+    )
     system_prompt = build_system_prompt(config.workdir, registry.names())
     client = LLMClient(config)
 
@@ -116,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         gate=gate,
         max_messages=config.max_messages,
         context_token_budget=config.context_token_budget,
+        transcript_dir=config.transcript_dir,
     )
 
     if config.transcript_dir is not None:

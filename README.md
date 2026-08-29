@@ -13,11 +13,11 @@
 ## 功能一览
 
 - Agent 主循环 + `max_steps` / 用户中断
-- 工具：`read_file` / `write_file` / `edit_file` / `list_dir` / `glob` / `run_shell` / `todo_write`
+- 工具：`read_file` / `write_file` / `edit_file` / `list_dir` / `glob` / `run_shell` / `todo_write` / `memory_search` / `rag_search`
 - 路径沙箱 + `--approval auto|ask|never`
 - 上下文裁剪（`MAX_MESSAGES`）+ 工具输出截断
 - **ACON 简化版 Context Manager**：分层上下文 + pytest 等观测压缩 + 超预算历史摘要折叠（`CONTEXT_TOKEN_BUDGET`）
-- **长短期记忆（P0）**：`MEMORY.md` 跨 run 注入/追加；todo 完成时阶段压缩进 `history_summary`；Web 续写用 memory 快照 + 最近 K 条（非整包 prior）
+- **长短期记忆（P0–P2）**：MEMORY.md、working_memory、续写瘦身、前缀/后缀布局、折叠重注、MicroCompact、失败对更新压缩 guideline、本地 TF–IDF `rag_search`、prompt-cache 钩子
 - 运行 transcript → `transcripts/*.json`（含 `memory` 快照）
 - 可选 Web UI（`python -m src.web`）
 

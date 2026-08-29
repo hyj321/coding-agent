@@ -178,7 +178,11 @@ def run_coding_task(
     if gate.approval == ApprovalMode.ASK:
         gate = PermissionGate(config.workdir, approval=ApprovalMode.AUTO)
 
-    registry = build_default_registry(gate, max_output_chars=config.max_tool_output_chars)
+    registry = build_default_registry(
+        gate,
+        max_output_chars=config.max_tool_output_chars,
+        transcript_dir=config.transcript_dir,
+    )
     system_prompt = build_system_prompt(config.workdir, registry.names())
     client = LLMClient(config)
 
@@ -221,6 +225,7 @@ def run_coding_task(
         prior_messages=prior_messages,
         prior_memory=prior_memory,
         context_token_budget=config.context_token_budget,
+        transcript_dir=config.transcript_dir,
     )
 
     transcript_path: Path | None = None
