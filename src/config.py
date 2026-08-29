@@ -8,6 +8,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from src.agent.permissions import ApprovalMode, parse_approval_mode
+
 
 @dataclass(frozen=True)
 class Config:
@@ -17,6 +19,9 @@ class Config:
     workdir: Path
     max_steps: int
     max_tool_output_chars: int = 8000
+    max_messages: int = 40
+    approval: ApprovalMode = ApprovalMode.AUTO
+    transcript_dir: Path | None = None
 
     @classmethod
     def from_env(
@@ -25,6 +30,9 @@ class Config:
         workdir: str | Path | None = None,
         model: str | None = None,
         max_steps: int | None = None,
+        approval: str | None = None,
+        transcript_dir: str | Path | None = None,
+        max_messages: int | None = None,
     ) -> Config:
         load_dotenv()
 
@@ -55,6 +63,23 @@ class Config:
             raise ValueError("MAX_STEPS must be >= 1")
 
         max_out = int(os.getenv("MAX_TOOL_OUTPUT_CHARS", "8000"))
+        keep = (
+            max_messages
+            if max_messages is not None
+            else int(os.getenv("MAX_MESSAGES", "40"))
+        )
+        if keep < 4:
+            raise ValueError("MAX_MESSAGES must be >= 4")
+
+        mode = parse_approval_mode(approval or os.getenv("APPROVAL") or "auto")
+
+        tdir_raw = transcript_dir if transcript_dir is not None else os.getenv("TRANSCRIPT_DIR")
+        if tdir_raw is None or str(tdir_raw).strip() == "":
+            tdir: Path | None = Path("transcripts").resolve()
+        elif str(tdir_raw).strip().lower() in {"off", "none", "false", "0"}:
+            tdir = None
+        else:
+            tdir = Path(tdir_raw).expanduser().resolve()
 
         return cls(
             api_key=api_key,
@@ -63,4 +88,7 @@ class Config:
             workdir=wd,
             max_steps=steps,
             max_tool_output_chars=max_out,
+            max_messages=keep,
+            approval=mode,
+            transcript_dir=tdir,
         )

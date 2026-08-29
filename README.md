@@ -1,65 +1,99 @@
-# Code Agent (V1)
+# Code Agent
 
-自研的最小可扩展编程智能体（coding agent harness）：通过 DeepSeek（OpenAI 兼容）的 **tool calling**，在本地读写文件、执行命令，完成你交给它的编程任务。
+自研编程智能体（coding agent harness）：通过 DeepSeek（OpenAI 兼容）**tool calling**，在本地读写文件、执行命令，完成编程任务。
 
-> 不使用 LangChain / AutoGen 等 agent 框架；工具执行、对话历史、循环终止均自行实现。
+> 不使用 LangChain / AutoGen 等 agent 框架；循环、工具、上下文、权限、transcript 均自行实现。
 
-## 功能（V1）
+仓库：https://github.com/hyj321/coding-agent
 
-- Agent 主循环：`call model → tool_calls → 本地执行 → append → 再 call`
-- 工具：`read_file` / `write_file` / `list_dir` / `run_shell`
-- 工作目录路径沙箱（文件操作不可逃逸 `workdir`）
-- 工具错误以字符串返回给模型，便于自我纠正
-- 终止：无工具调用的最终回复 / `max_steps` / Ctrl+C
-- 过程日志：每步打印工具名、参数摘要、结果摘要
+## 特色（Day3）
 
-## 快速开始
+**Plan-then-Act（`todo_write`）**：非平凡任务先写检查清单，保持最多一项 `in_progress`，边做边更新，降低跑偏；过程在终端与 transcript 中可见，便于演示与答辩。
 
-```bash
-# 1. 创建虚拟环境并安装依赖
-python -m venv .venv
-# Windows PowerShell:
-.\.venv\Scripts\Activate.ps1
+## 功能一览
+
+- Agent 主循环 + `max_steps` / 用户中断
+- 工具：`read_file` / `write_file` / `edit_file` / `list_dir` / `glob` / `run_shell` / `todo_write`
+- 路径沙箱 + `--approval auto|ask|never`
+- 上下文裁剪（`MAX_MESSAGES`）+ 工具输出截断
+- 运行 transcript → `transcripts/*.json`
+- 可选 Web UI（`python -m src.web`）
+
+## 快速开始（CLI）
+
+```powershell
+conda create -n codeagent python=3.11 -y
+conda activate codeagent
+cd G:\codeagent
 pip install -r requirements.txt
-
-# 2. 配置密钥（不要提交 .env）
 copy .env.example .env
 # 编辑 .env，填入 DEEPSEEK_API_KEY
 
-# 3. 运行
-python -m src.main "在当前目录创建一个 hello.py，打印 Hello Agent，并用 python 运行它"
+python -m scripts.smoke_v1
+python -m src.main -w demos --approval auto "阅读 greeter_test.py，修复 greeter.py 使测试通过。先用 todo_write 规划，再执行，最后运行 python greeter_test.py。"
 ```
 
-常用参数：
+演示说明见 [`demos/DEMO.md`](demos/DEMO.md)。
 
-```bash
-python -m src.main -w ./demos --max-steps 15 "列出目录并说明有哪些文件"
-python -m src.main -m deepseek-v4-pro "修复 xxx"
+## Web 界面（可选）
+
+风格参考现代 AI 聊天产品（侧栏 + 问候 + 快捷卡片 + 底部输入），**背后仍调用同一套自研 agent**，不是套壳第三方 agent。
+
+```powershell
+conda activate codeagent
+cd G:\codeagent
+pip install -r requirements.txt
+python -m src.web
 ```
 
-## 环境变量
+浏览器打开：http://127.0.0.1:7860
 
-| 变量 | 说明 |
-|------|------|
-| `DEEPSEEK_API_KEY` 或 `API_KEY` | API 密钥（必填） |
-| `BASE_URL` | 默认 `https://api.deepseek.com` |
-| `MODEL` | 默认 `deepseek-v4-flash` |
-| `WORKDIR` | 默认 `.` |
-| `MAX_STEPS` | 默认 `20` |
+- 点卡片或输入框提交任务
+- **结构化步骤卡片**：完成的步骤自动折叠，点击可展开；**正在运行的步骤滚到屏幕中间**并高亮
+- **富文本**：最终回复 / 思考 / 任务支持 Markdown（标题、列表、代码块等）
+- **Todo 面板**：随 `todo_write` 实时勾选
+- 左侧 Recent：**点击可回看**完整过程（不耗 API）
+- 侧栏 **Reset demos**：把 `greeter.py` / `buggy_calc.py` 恢复为有意 bug
+- 同时只允许一个任务运行（第二个返回 409）
 
-## 架构（可扩展）
+CLI 仍然可用：`python -m src.main ...`
+
+## 架构说明（面试可用）
 
 ```
-CLI → Agent Loop → LLM Client (DeepSeek)
-                ↘ Tool Registry → filesystem / shell
-                ↘ Context (system prompt)
-                ↘ Permissions (path sandbox)
+用户任务
+   ↓
+CLI (src/main.py)
+   ↓
+Agent Loop (src/agent/loop.py)
+   │  while step <= max_steps:
+   │    trim_messages → chat(tools) → 若无 tool_calls 则结束
+   │    对每个 tool_call: authorize → dispatch → append tool result
+   ↓
+┌──────────────┬─────────────────┬──────────────────┐
+│ LLM Client   │ Tool Registry   │ Permissions      │
+│ DeepSeek     │ schema+handler  │ 沙箱 + approval  │
+│ OpenAI 兼容  │ 本地执行        │ hard-deny 危险命令│
+└──────────────┴─────────────────┴──────────────────┘
+         Context: system 快照 + 历史裁剪
+         Transcript: 整次 run 落盘 JSON
 ```
 
-- **新工具**：在 `src/tools/` 实现并在 `build_default_registry` 注册即可，主循环不用改。
-- **换模型**：改 `BASE_URL` / `MODEL`。
-- **Day2+**：`edit_file`、上下文裁剪、approval、transcript、Todo 等按 `计划书.md` 推进。
+设计要点：
 
-## 项目结构
+1. **模型只出意图，副作用在本地**——工具结果必须写回 messages，模型才能感知。
+2. **新工具 = 注册表加一项**，主循环不必改。
+3. **Todo 是一等工具**，不是另起一套框架；规划与执行仍在同一 loop 里。
 
-见 `计划书.md`。开发进度也记在该文件中。
+## 环境变量 / CLI
+
+| 变量或参数 | 说明 |
+|------------|------|
+| `DEEPSEEK_API_KEY` | 必填 |
+| `BASE_URL` / `MODEL` | 默认 DeepSeek flash |
+| `-w` | 工作目录沙箱 |
+| `--approval` | `auto` / `ask` / `never` |
+| `--max-steps` / `--max-messages` | 循环与上下文上限 |
+| `--transcript-dir` | 默认 `transcripts`；`off` 关闭 |
+
+进度与计划见 `计划书.md`。

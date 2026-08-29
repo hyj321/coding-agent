@@ -63,6 +63,62 @@ def register_filesystem_tools(
             return "(empty directory)"
         return _truncate("\n".join(entries), max_output_chars)
 
+    def edit_file(args: dict[str, Any]) -> str:
+        path = gate.resolve_path(args["path"])
+        old = args.get("old_string")
+        new = args.get("new_string")
+        if old is None or new is None:
+            return "Error: edit_file requires 'old_string' and 'new_string'"
+        old_s = str(old)
+        new_s = str(new)
+        if old_s == "":
+            return "Error: old_string must not be empty"
+        if not path.exists():
+            return f"Error: file not found: {path}"
+        if not path.is_file():
+            return f"Error: not a file: {path}"
+        try:
+            content = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return f"Error: cannot decode as UTF-8: {path}"
+
+        count = content.count(old_s)
+        if count == 0:
+            return (
+                "Error: old_string not found in file. "
+                "Read the file again and use an exact contiguous substring."
+            )
+        replace_all = bool(args.get("replace_all", False))
+        if count > 1 and not replace_all:
+            return (
+                f"Error: old_string matched {count} times. "
+                "Provide a more specific old_string, or set replace_all=true."
+            )
+        updated = content.replace(old_s, new_s) if replace_all else content.replace(old_s, new_s, 1)
+        path.write_text(updated, encoding="utf-8")
+        rel = path.relative_to(gate.workdir).as_posix()
+        n = count if replace_all else 1
+        return f"Edited {rel}: replaced {n} occurrence(s)."
+
+    def glob_files(args: dict[str, Any]) -> str:
+        pattern = args.get("pattern")
+        if not pattern or not isinstance(pattern, str):
+            return "Error: missing required string argument 'pattern'"
+        # Prevent escaping via absolute patterns; resolve matches under workdir only.
+        root = gate.workdir
+        matches: list[str] = []
+        for match in sorted(root.glob(pattern)):
+            try:
+                resolved = match.resolve()
+                resolved.relative_to(root)
+            except (ValueError, OSError):
+                continue
+            if resolved.is_file():
+                matches.append(resolved.relative_to(root).as_posix())
+        if not matches:
+            return f"(no files matched pattern {pattern!r})"
+        return _truncate("\n".join(matches), max_output_chars)
+
     registry.register(
         FunctionTool(
             name="read_file",
@@ -122,6 +178,59 @@ def register_filesystem_tools(
                 "required": [],
             },
             handler=list_dir,
+        )
+    )
+    registry.register(
+        FunctionTool(
+            name="edit_file",
+            description=(
+                "Replace an exact substring in an existing UTF-8 file. "
+                "Prefer this over write_file for small, precise edits. "
+                "old_string must match exactly (including whitespace)."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to the working directory.",
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "Exact text to find in the file.",
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "Replacement text.",
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "If true, replace every match; default false (single match required).",
+                    },
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+            handler=edit_file,
+        )
+    )
+    registry.register(
+        FunctionTool(
+            name="glob",
+            description=(
+                "Find files under the working directory matching a glob pattern "
+                "(e.g. '**/*.py', 'src/**/*.ts'). Returns relative paths."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern relative to the working directory.",
+                    }
+                },
+                "required": ["pattern"],
+            },
+            handler=glob_files,
         )
     )
 

@@ -8,6 +8,7 @@ import sys
 from src.agent.context import build_system_prompt
 from src.agent.loop import run_agent
 from src.agent.permissions import PermissionGate
+from src.agent.transcript import save_transcript
 from src.config import Config
 from src.llm.client import LLMClient
 from src.tools import build_default_registry
@@ -41,6 +42,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Max model/tool iterations (default: MAX_STEPS env or 20).",
     )
+    p.add_argument(
+        "--approval",
+        choices=["auto", "ask", "never"],
+        default=None,
+        help="Tool approval policy: auto (default), ask (confirm mutating/risky), never (deny risky).",
+    )
+    p.add_argument(
+        "--max-messages",
+        type=int,
+        default=None,
+        help="Max messages kept in model context (default: MAX_MESSAGES env or 40).",
+    )
+    p.add_argument(
+        "--transcript-dir",
+        default=None,
+        help="Directory for JSON transcripts (default: transcripts/). Use 'off' to disable.",
+    )
     return p
 
 
@@ -52,6 +70,9 @@ def main(argv: list[str] | None = None) -> int:
             workdir=args.workdir,
             model=args.model,
             max_steps=args.max_steps,
+            approval=args.approval,
+            transcript_dir=args.transcript_dir,
+            max_messages=args.max_messages,
         )
     except ValueError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
@@ -66,13 +87,14 @@ def main(argv: list[str] | None = None) -> int:
         print("No task provided.", file=sys.stderr)
         return 2
 
-    gate = PermissionGate(config.workdir)
+    gate = PermissionGate(config.workdir, approval=config.approval)
     registry = build_default_registry(gate, max_output_chars=config.max_tool_output_chars)
     system_prompt = build_system_prompt(config.workdir, registry.names())
     client = LLMClient(config)
 
     print(f"[config] workdir={config.workdir}")
     print(f"[config] base_url={config.base_url} model={config.model}")
+    print(f"[config] approval={config.approval.value} max_messages={config.max_messages}")
 
     result = run_agent(
         client=client,
@@ -80,7 +102,22 @@ def main(argv: list[str] | None = None) -> int:
         system_prompt=system_prompt,
         user_task=task,
         max_steps=config.max_steps,
+        gate=gate,
+        max_messages=config.max_messages,
     )
+
+    if config.transcript_dir is not None:
+        path = save_transcript(
+            config.transcript_dir,
+            task=task,
+            result=result,
+            meta={
+                "model": config.model,
+                "workdir": str(config.workdir),
+                "approval": config.approval.value,
+            },
+        )
+        print(f"[transcript] {path}")
 
     print("\n========== RESULT ==========")
     print(f"stopped_reason: {result.stopped_reason}")
