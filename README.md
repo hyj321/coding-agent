@@ -16,7 +16,9 @@
 - 工具：`read_file` / `write_file` / `edit_file` / `list_dir` / `glob` / `run_shell` / `todo_write`
 - 路径沙箱 + `--approval auto|ask|never`
 - 上下文裁剪（`MAX_MESSAGES`）+ 工具输出截断
-- 运行 transcript → `transcripts/*.json`
+- **ACON 简化版 Context Manager**：分层上下文 + pytest 等观测压缩 + 超预算历史摘要折叠（`CONTEXT_TOKEN_BUDGET`）
+- **长短期记忆（P0）**：`MEMORY.md` 跨 run 注入/追加；todo 完成时阶段压缩进 `history_summary`；Web 续写用 memory 快照 + 最近 K 条（非整包 prior）
+- 运行 transcript → `transcripts/*.json`（含 `memory` 快照）
 - 可选 Web UI（`python -m src.web`）
 
 ## 快速开始（CLI）
@@ -51,8 +53,10 @@ python -m src.web
 - 点卡片或输入框提交任务
 - **结构化步骤卡片**：完成的步骤自动折叠，点击可展开；**正在运行的步骤滚到屏幕中间**并高亮
 - **富文本**：最终回复 / 思考 / 任务支持 Markdown（标题、列表、代码块等）
-- **Todo 面板**：随 `todo_write` 实时勾选
-- 左侧 Recent：**点击可回看**完整过程（不耗 API）
+- **左侧栏固定**：不随中间区滚动；**Recent chats** 独立滚动；**一整轮对话 = 一条 session 历史**（多轮续写：喂模型用 memory + 最近 K，磁盘保留完整 messages）
+- **Open folder**：顶部打开文件夹 → 更新 Workdir；右侧 **Files** 树可浏览，点击文件新窗口打开
+- **Changed files**：`write_file` / `edit_file` 后底部列出改动，点击查看新旧对比
+- **Plan 面板**：随 `todo_write` 实时勾选（右侧 Files / Plan 可切换、可折叠）
 - 侧栏 **Reset demos**：把 `greeter.py` / `buggy_calc.py` 恢复为有意 bug
 - 同时只允许一个任务运行（第二个返回 409）
 
@@ -75,8 +79,8 @@ Agent Loop (src/agent/loop.py)
 │ DeepSeek     │ schema+handler  │ 沙箱 + approval  │
 │ OpenAI 兼容  │ 本地执行        │ hard-deny 危险命令│
 └──────────────┴─────────────────┴──────────────────┘
-         Context: system 快照 + 历史裁剪
-         Transcript: 整次 run 落盘 JSON
+         Context: Context Manager + MEMORY.md + 历史折叠
+         Transcript: session / run JSON（含 memory 快照）
 ```
 
 设计要点：
@@ -94,6 +98,7 @@ Agent Loop (src/agent/loop.py)
 | `-w` | 工作目录沙箱 |
 | `--approval` | `auto` / `ask` / `never` |
 | `--max-steps` / `--max-messages` | 循环与上下文上限 |
+| `--context-budget` / `CONTEXT_TOKEN_BUDGET` | Context Manager 近似 token 预算（默认 8000） |
 | `--transcript-dir` | 默认 `transcripts`；`off` 关闭 |
 
 进度与计划见 `计划书.md`。

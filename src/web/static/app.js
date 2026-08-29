@@ -9,16 +9,49 @@ const maxStepsInput = document.getElementById("maxStepsInput");
 const suggestionCards = document.getElementById("suggestionCards");
 const recentList = document.getElementById("recentList");
 const historySearch = document.getElementById("historySearch");
-const todoPanel = document.getElementById("todoPanel");
 const todoList = document.getElementById("todoList");
+const todoEmpty = document.getElementById("todoEmpty");
 const runStatus = document.getElementById("runStatus");
+const workspace = document.querySelector(".workspace");
+const fileTree = document.getElementById("fileTree");
+const filesWorkdir = document.getElementById("filesWorkdir");
+const filesPane = document.getElementById("filesPane");
+const planPane = document.getElementById("planPane");
+const changedBar = document.getElementById("changedBar");
+const changedList = document.getElementById("changedList");
+const folderModal = document.getElementById("folderModal");
+const folderPathInput = document.getElementById("folderPathInput");
+const folderListing = document.getElementById("folderListing");
+const codeModal = document.getElementById("codeModal");
+const codeTitle = document.getElementById("codeTitle");
+const codeTabName = document.getElementById("codeTabName");
+const codeModeBadge = document.getElementById("codeModeBadge");
+const codeLangLabel = document.getElementById("codeLangLabel");
+const monacoHost = document.getElementById("monacoHost");
 
 let running = false;
 let historyCache = [];
-let stepCards = new Map(); // step -> DOM element
+let stepCards = new Map();
 let activeStep = null;
+/** One conversation (= one history / memory unit). */
+let sessionId = null;
+let sessionActive = false;
+/** Offset so multi-turn sessions don't reuse Step 1 badges in the DOM map. */
+let stepKeyBase = 0;
+/** path -> { path, old_content, new_content, is_new, tool } */
+let changedFiles = new Map();
+let projectRoot = "";
+let monacoReady = null;
+let monacoEditor = null;
+let monacoDiff = null;
+let monacoMode = null; // "code" | "diff"
 
 const ICONS = ["🌐", "📈", "📄"];
+
+function newSessionId() {
+  if (crypto.randomUUID) return crypto.randomUUID().replace(/-/g, "").slice(0, 24);
+  return `s${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+}
 
 function setStatus(mode, text) {
   runStatus.className = `run-status ${mode}`;
@@ -43,15 +76,32 @@ function showChat() {
   chatView.classList.remove("hidden");
 }
 
-function showHome() {
-  homeView.classList.remove("hidden");
-  chatView.classList.add("hidden");
+function resetSessionUI() {
+  // Detach before wiping timeline so the node is not destroyed
+  if (changedBar && changedBar.parentElement === timeline) {
+    chatView.appendChild(changedBar);
+  }
   timeline.innerHTML = "";
   stepCards = new Map();
   activeStep = null;
-  todoPanel.classList.add("hidden");
+  stepKeyBase = 0;
+  changedFiles = new Map();
+  renderChangedBar();
   todoList.innerHTML = "";
+  todoEmpty.classList.remove("hidden");
   setStatus("idle", "Idle");
+}
+
+function mapStep(step) {
+  return stepKeyBase + step;
+}
+
+function showHome() {
+  homeView.classList.remove("hidden");
+  chatView.classList.add("hidden");
+  sessionId = null;
+  sessionActive = false;
+  resetSessionUI();
 }
 
 function scrollChat() {
@@ -60,7 +110,6 @@ function scrollChat() {
 
 function focusActiveCard(card) {
   if (!card) return;
-  // Center the running step in the chat viewport
   requestAnimationFrame(() => {
     card.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
   });
@@ -78,22 +127,12 @@ function collapseStepCard(card) {
   }
 }
 
-function expandStepCard(card) {
-  if (!card) return;
-  card.classList.remove("is-collapsed");
-}
-
 function setActiveStep(step, maxSteps) {
-  if (activeStep != null && activeStep !== step) {
-    const prev = stepCards.get(activeStep);
-    if (prev && !prev.classList.contains("is-collapsed")) {
-      // keep expanded until markStepDone collapses it
-    }
-  }
-  activeStep = step;
+  const key = mapStep(step);
+  activeStep = key;
   const card = ensureStepCard(step, maxSteps);
   stepCards.forEach((c, s) => {
-    if (s === step) {
+    if (s === key) {
       c.classList.add("is-active");
       c.classList.remove("is-collapsed");
     } else {
@@ -119,7 +158,6 @@ function addUserBubble(text) {
 }
 
 function addFinalBubble(text, meta) {
-  // Collapse any still-open active step
   if (activeStep != null) {
     const card = stepCards.get(activeStep);
     if (card) collapseStepCard(card);
@@ -143,6 +181,8 @@ function addFinalBubble(text, meta) {
   }
   row.appendChild(msg);
   timeline.appendChild(row);
+  // Keep changed-files bar under the latest FINAL output
+  if (changedFiles.size) renderChangedBar();
   focusActiveCard(msg);
 }
 
@@ -155,8 +195,9 @@ function addInfoBubble(text) {
 }
 
 function ensureStepCard(step, maxSteps) {
-  if (stepCards.has(step)) {
-    const existing = stepCards.get(step);
+  const key = mapStep(step);
+  if (stepCards.has(key)) {
+    const existing = stepCards.get(key);
     if (maxSteps) {
       const badge = existing.querySelector(".step-badge");
       if (badge) badge.textContent = `Step ${step}/${maxSteps}`;
@@ -165,7 +206,7 @@ function ensureStepCard(step, maxSteps) {
   }
   const card = document.createElement("div");
   card.className = "step-card is-active";
-  card.dataset.step = String(step);
+  card.dataset.step = String(key);
   card.innerHTML = `
     <button type="button" class="step-head" aria-expanded="true">
       <span class="step-badge">Step ${step}${maxSteps ? "/" + maxSteps : ""}</span>
@@ -183,7 +224,7 @@ function ensureStepCard(step, maxSteps) {
     head.setAttribute("aria-expanded", collapsed ? "false" : "true");
   });
   timeline.appendChild(card);
-  stepCards.set(step, card);
+  stepCards.set(key, card);
   focusActiveCard(card);
   return card;
 }
@@ -228,7 +269,6 @@ function addToolResult(step, data) {
   details.classList.remove("hidden");
   const pre = details.querySelector("pre");
   const resultText = data.result || data.result_summary || "";
-  // Rich text for tool results that look like markdown / todo lists
   if (/\*\*|`|# |Todo list:/.test(resultText)) {
     const wrap = document.createElement("div");
     wrap.className = "rich tool-rich";
@@ -240,23 +280,25 @@ function addToolResult(step, data) {
   focusActiveCard(card);
 }
 
-function markStepDone(step, kind) {
-  const card = stepCards.get(step);
+function markStepDone(step) {
+  const card = stepCards.get(mapStep(step));
   if (!card) return;
   const state = card.querySelector(".step-state");
-  state.textContent = kind === "final" ? "done" : "done";
+  state.textContent = "done";
   state.classList.add("done");
   collapseStepCard(card);
   card.querySelector(".step-head")?.setAttribute("aria-expanded", "false");
 }
 
 function renderTodos(todos) {
+  todoList.innerHTML = "";
   if (!todos || !todos.length) {
-    todoPanel.classList.add("hidden");
+    todoEmpty.classList.remove("hidden");
     return;
   }
-  todoPanel.classList.remove("hidden");
-  todoList.innerHTML = "";
+  todoEmpty.classList.add("hidden");
+  // Auto-switch to Plan tab when todos appear
+  switchRightTab("plan");
   todos.forEach((t) => {
     const li = document.createElement("div");
     li.className = `todo-item status-${t.status}`;
@@ -267,6 +309,179 @@ function renderTodos(todos) {
     li.innerHTML = `<span class="todo-mark">${mark}</span><span class="todo-text">${escapeHtml(t.content)}</span>`;
     todoList.appendChild(li);
   });
+}
+
+function renderChangedBar() {
+  changedList.innerHTML = "";
+  if (!changedFiles.size) {
+    changedBar.classList.add("hidden");
+    changedBar.hidden = true;
+    return;
+  }
+  changedBar.hidden = false;
+  changedBar.classList.remove("hidden");
+  // Always pin to the end of the timeline (after FINAL / latest output)
+  if (changedBar.parentElement !== timeline) {
+    timeline.appendChild(changedBar);
+  } else {
+    timeline.appendChild(changedBar);
+  }
+  for (const ch of changedFiles.values()) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `changed-chip${ch.is_new ? " is-new" : ""}`;
+    btn.textContent = ch.is_new ? `${ch.path} (new)` : ch.path;
+    btn.title = "View diff in VS Code editor";
+    btn.addEventListener("click", () => openDiff(ch));
+    changedList.appendChild(btn);
+  }
+  scrollChat();
+}
+
+function recordFileChange(data) {
+  const path = data.path;
+  if (!path) return;
+  const prev = changedFiles.get(path);
+  changedFiles.set(path, {
+    path,
+    tool: data.tool,
+    is_new: prev ? prev.is_new && data.is_new : !!data.is_new,
+    old_content: prev ? prev.old_content : (data.old_content ?? ""),
+    new_content: data.new_content ?? "",
+  });
+  renderChangedBar();
+  loadFileTree();
+}
+
+function langFromPath(path) {
+  const ext = String(path).split(".").pop()?.toLowerCase() || "";
+  const map = {
+    py: "python",
+    js: "javascript",
+    mjs: "javascript",
+    cjs: "javascript",
+    ts: "typescript",
+    tsx: "typescript",
+    jsx: "javascript",
+    json: "json",
+    md: "markdown",
+    html: "html",
+    htm: "html",
+    css: "css",
+    scss: "scss",
+    less: "less",
+    yml: "yaml",
+    yaml: "yaml",
+    sh: "shell",
+    bash: "shell",
+    ps1: "powershell",
+    sql: "sql",
+    rs: "rust",
+    go: "go",
+    java: "java",
+    c: "c",
+    h: "c",
+    cpp: "cpp",
+    hpp: "cpp",
+    xml: "xml",
+    toml: "ini",
+    ini: "ini",
+    txt: "plaintext",
+  };
+  return map[ext] || "plaintext";
+}
+
+function loadMonaco() {
+  if (monacoReady) return monacoReady;
+  monacoReady = new Promise((resolve, reject) => {
+    if (typeof require === "undefined") {
+      reject(new Error("Monaco loader missing"));
+      return;
+    }
+    require.config({
+      paths: { vs: "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs" },
+    });
+    // eslint-disable-next-line no-undef
+    require(["vs/editor/editor.main"], () => resolve(window.monaco), reject);
+  });
+  return monacoReady;
+}
+
+function disposeMonacoEditors() {
+  if (monacoEditor) {
+    monacoEditor.dispose();
+    monacoEditor = null;
+  }
+  if (monacoDiff) {
+    monacoDiff.dispose();
+    monacoDiff = null;
+  }
+  monacoMode = null;
+  monacoHost.innerHTML = "";
+}
+
+async function openCodeViewer(path, content, { modeBadge = "Preview" } = {}) {
+  const lang = langFromPath(path);
+  codeTitle.textContent = path;
+  codeTabName.textContent = path.split(/[/\\]/).pop() || path;
+  codeModeBadge.textContent = modeBadge;
+  codeLangLabel.textContent = lang;
+  codeModal.classList.remove("hidden");
+  disposeMonacoEditors();
+  try {
+    const monaco = await loadMonaco();
+    monacoMode = "code";
+    monacoEditor = monaco.editor.create(monacoHost, {
+      value: content ?? "",
+      language: lang,
+      theme: "vs-dark",
+      readOnly: true,
+      automaticLayout: true,
+      minimap: { enabled: true },
+      fontSize: 13,
+      fontFamily: "Consolas, 'Courier New', monospace",
+      lineNumbers: "on",
+      renderLineHighlight: "line",
+      scrollBeyondLastLine: false,
+      wordWrap: "off",
+      padding: { top: 8 },
+    });
+  } catch (err) {
+    monacoHost.innerHTML = `<pre style="color:#ccc;padding:16px;margin:0;white-space:pre-wrap">${escapeHtml(content || String(err))}</pre>`;
+  }
+}
+
+async function openDiff(ch) {
+  const path = ch.path || "file";
+  const lang = langFromPath(path);
+  codeTitle.textContent = `${path} (diff)`;
+  codeTabName.textContent = path.split(/[/\\]/).pop() || path;
+  codeModeBadge.textContent = ch.is_new ? "New file" : "Diff";
+  codeLangLabel.textContent = lang;
+  codeModal.classList.remove("hidden");
+  disposeMonacoEditors();
+  try {
+    const monaco = await loadMonaco();
+    monacoMode = "diff";
+    const original = monaco.editor.createModel(ch.old_content ?? "", lang);
+    const modified = monaco.editor.createModel(ch.new_content ?? "", lang);
+    monacoDiff = monaco.editor.createDiffEditor(monacoHost, {
+      theme: "vs-dark",
+      readOnly: true,
+      automaticLayout: true,
+      renderSideBySide: true,
+      enableSplitViewResizing: true,
+      minimap: { enabled: false },
+      fontSize: 13,
+      fontFamily: "Consolas, 'Courier New', monospace",
+      originalEditable: false,
+      renderIndicators: true,
+      ignoreTrimWhitespace: false,
+    });
+    monacoDiff.setModel({ original, modified });
+  } catch (err) {
+    monacoHost.innerHTML = `<pre style="color:#ccc;padding:16px;margin:0;white-space:pre-wrap">Diff failed: ${escapeHtml(String(err))}</pre>`;
+  }
 }
 
 function renderSuggestions(items) {
@@ -304,7 +519,8 @@ function renderHistory(items) {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "recent-item";
-    btn.innerHTML = `<span class="bubble">💬</span><span>${escapeHtml(item.title)}</span>`;
+    const kind = item.kind === "session" ? "🗂" : "💬";
+    btn.innerHTML = `<span class="bubble">${kind}</span><span>${escapeHtml(item.title)}</span>`;
     btn.addEventListener("click", () => loadTranscript(item.id));
     recentList.appendChild(btn);
   });
@@ -322,6 +538,7 @@ function handleEvent(data) {
   switch (data.type) {
     case "start":
       addInfoBubble(`workdir: ${data.workdir}`);
+      if (data.session_id) sessionId = data.session_id;
       break;
     case "run_start":
       break;
@@ -344,14 +561,16 @@ function handleEvent(data) {
     case "tool_result":
       addToolResult(data.step, data);
       break;
+    case "file_change":
+      recordFileChange(data);
+      break;
     case "todo_update":
       renderTodos(data.todos || []);
       break;
     case "step_end":
-      markStepDone(data.step, data.kind);
+      markStepDone(data.step);
       break;
     case "final":
-      // done event also carries final; avoid double if both fire
       break;
     case "done":
       addFinalBubble(
@@ -360,34 +579,49 @@ function handleEvent(data) {
           (data.transcript_id ? ` · ${data.transcript_id}` : "")
       );
       setStatus("idle", "Done");
+      sessionActive = true;
       break;
     case "error":
       addInfoBubble(data.message || "Unknown error");
       setStatus("err", "Error");
       break;
     case "log":
-      // Structured events preferred; skip noisy raw logs in UI.
       break;
     default:
       break;
   }
 }
 
-/** Replay a saved transcript into the same card UI (no API cost). */
 function replayTranscript(data) {
   showChat();
-  timeline.innerHTML = "";
-  stepCards = new Map();
-  activeStep = null;
-  todoPanel.classList.add("hidden");
-  todoList.innerHTML = "";
+  resetSessionUI();
+  sessionId = data.session_id || (data.meta || {}).session_id || null;
+  sessionActive = !!sessionId;
 
   const task = data.task || "";
-  addUserBubble(task);
-  addInfoBubble(`Replay · ${data.created_at || ""} · ${data.stopped_reason || ""}`);
+  const turns = data.turns || [];
+  if (turns.length > 1) {
+    addInfoBubble(`Session · ${turns.length} turns · ${data.updated_at || data.created_at || ""}`);
+    turns.forEach((t, i) => {
+      addUserBubble(t.task || task);
+      if (i < turns.length - 1 && t.final_text) {
+        addFinalBubble(t.final_text, `${t.stopped_reason || ""} · turn ${i + 1}`);
+      }
+    });
+  } else {
+    addUserBubble(task);
+    addInfoBubble(`Replay · ${data.created_at || ""} · ${data.stopped_reason || ""}`);
+  }
+
+  const wd = (data.meta || {}).workdir;
+  if (wd) {
+    workdirInput.value = wd;
+    loadFileTree();
+  }
 
   const messages = data.messages || [];
   let step = 0;
+  // For multi-turn sessions, only replay tool steps from the message log once
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
     if (m.role === "assistant" && m.tool_calls && m.tool_calls.length) {
@@ -428,9 +662,13 @@ function replayTranscript(data) {
           if (todos.length) renderTodos(todos);
         }
       }
-      markStepDone(step, "tools");
+      markStepDone(step);
     }
   }
+
+  const changes = data.file_changes || [];
+  for (const ch of changes) recordFileChange(ch);
+
   addFinalBubble(
     data.final_text || "",
     `${data.stopped_reason || ""} · ${data.steps || step} steps (replay)`
@@ -471,7 +709,12 @@ async function loadTranscript(id) {
 async function loadMeta() {
   const res = await fetch("/api/meta");
   const data = await res.json();
+  projectRoot = data.project_root || "";
+  if (data.default_workdir && !workdirInput.dataset.touched) {
+    workdirInput.value = data.default_workdir;
+  }
   renderSuggestions(data.suggestions || []);
+  loadFileTree();
 }
 
 async function loadHistory() {
@@ -481,12 +724,55 @@ async function loadHistory() {
   renderHistory(historyCache);
 }
 
+async function loadFileTree() {
+  const wd = workdirInput.value.trim() || "demos";
+  filesWorkdir.textContent = wd;
+  try {
+    const res = await fetch(`/api/fs/tree?workdir=${encodeURIComponent(wd)}`);
+    if (!res.ok) {
+      fileTree.innerHTML = `<div class="todo-empty">Cannot list workdir</div>`;
+      return;
+    }
+    const data = await res.json();
+    filesWorkdir.textContent = data.workdir || wd;
+    fileTree.innerHTML = "";
+    (data.nodes || []).forEach((node) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `file-node${node.kind === "dir" ? " is-dir" : ""}`;
+      btn.style.paddingLeft = `${8 + (node.depth || 0) * 14}px`;
+      btn.innerHTML = `<span class="icon">${node.kind === "dir" ? "📁" : "📄"}</span><span>${escapeHtml(node.name)}</span>`;
+      if (node.kind === "file") {
+        btn.addEventListener("click", () => openFileWindow(node.path));
+      }
+      fileTree.appendChild(btn);
+    });
+    if (!(data.nodes || []).length) {
+      fileTree.innerHTML = `<div class="todo-empty">Empty folder</div>`;
+    }
+  } catch (err) {
+    fileTree.innerHTML = `<div class="todo-empty">${escapeHtml(String(err))}</div>`;
+  }
+}
+
+function openFileWindow(relPath) {
+  const wd = workdirInput.value.trim() || "demos";
+  fetch(`/api/fs/file?workdir=${encodeURIComponent(wd)}&path=${encodeURIComponent(relPath)}`)
+    .then(async (res) => {
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || res.status);
+      return openCodeViewer(data.path || relPath, data.content || "", { modeBadge: "Preview" });
+    })
+    .catch((err) => alert("Open file failed: " + err));
+}
+
 async function resetDemos() {
   try {
     const res = await fetch("/api/demos/reset", { method: "POST" });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || res.status);
     alert("Demos reset:\n" + (data.reset || []).join("\n"));
+    loadFileTree();
   } catch (err) {
     alert("Reset failed: " + err);
   }
@@ -500,18 +786,30 @@ async function startRun(taskText) {
   sendBtn.disabled = true;
   setStatus("running", "Running…");
   showChat();
-  // Keep previous run visible above? Clear for clarity on new run.
-  timeline.innerHTML = "";
-  stepCards = new Map();
-  activeStep = null;
-  todoPanel.classList.add("hidden");
-  todoList.innerHTML = "";
+
+  // Same session: keep timeline (multi-turn conversation = one history).
+  // New session: clear and mint session id.
+  if (!sessionActive || !sessionId) {
+    resetSessionUI();
+    sessionId = newSessionId();
+    sessionActive = true;
+  } else {
+    // Continuing: keep DOM history; offset step keys for the new turn
+    if (activeStep != null) {
+      const card = stepCards.get(activeStep);
+      if (card) collapseStepCard(card);
+    }
+    stepKeyBase += 1000;
+    activeStep = null;
+  }
+
   addUserBubble(task);
 
   const payload = {
     task,
     workdir: workdirInput.value.trim() || "demos",
     max_steps: Number(maxStepsInput.value) || 20,
+    session_id: sessionId,
   };
 
   try {
@@ -553,6 +851,87 @@ async function startRun(taskText) {
     chatInput.value = "";
     if (runStatus.textContent === "Running…") setStatus("idle", "Idle");
     loadHistory();
+    loadFileTree();
+  }
+}
+
+/* —— Open folder modal —— */
+async function openFolderModal() {
+  const start = workdirInput.value.trim() || projectRoot || "demos";
+  folderPathInput.value = start;
+  folderModal.classList.remove("hidden");
+  await browseFolder(start);
+}
+
+async function browseFolder(path) {
+  try {
+    const res = await fetch(`/api/fs/list?path=${encodeURIComponent(path || "")}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || res.status);
+    folderPathInput.value = data.path;
+    folderListing.innerHTML = "";
+    if (data.parent) {
+      const up = document.createElement("button");
+      up.type = "button";
+      up.className = "folder-entry is-dir";
+      up.innerHTML = `<span>⬆</span><span>..</span>`;
+      up.addEventListener("click", () => browseFolder(data.parent));
+      up.addEventListener("dblclick", () => browseFolder(data.parent));
+      folderListing.appendChild(up);
+    }
+    (data.entries || []).forEach((ent) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `folder-entry${ent.kind === "dir" ? " is-dir" : ""}`;
+      btn.innerHTML = `<span>${ent.kind === "dir" ? "📁" : "📄"}</span><span>${escapeHtml(ent.name)}</span>`;
+      if (ent.kind === "dir") {
+        btn.addEventListener("dblclick", () => browseFolder(ent.path));
+        btn.addEventListener("click", () => {
+          folderPathInput.value = ent.path;
+        });
+      }
+      folderListing.appendChild(btn);
+    });
+  } catch (err) {
+    folderListing.innerHTML = `<div class="todo-empty">${escapeHtml(String(err))}</div>`;
+  }
+}
+
+async function selectFolder() {
+  const path = folderPathInput.value.trim();
+  if (!path) return;
+  try {
+    const res = await fetch("/api/workdir", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || res.status);
+    workdirInput.value = data.workdir;
+    workdirInput.dataset.touched = "1";
+    folderModal.classList.add("hidden");
+    loadFileTree();
+    switchRightTab("files");
+    workspace.classList.remove("right-collapsed");
+  } catch (err) {
+    alert("Open folder failed: " + err);
+  }
+}
+
+function switchRightTab(name) {
+  document.querySelectorAll(".rp-tab").forEach((t) => {
+    t.classList.toggle("active", t.dataset.tab === name);
+  });
+  filesPane.classList.toggle("hidden", name !== "files");
+  planPane.classList.toggle("hidden", name !== "plan");
+}
+
+function closeModal(which) {
+  if (which === "folder") folderModal.classList.add("hidden");
+  if (which === "code" || which === "diff") {
+    codeModal.classList.add("hidden");
+    disposeMonacoEditors();
   }
 }
 
@@ -561,6 +940,10 @@ composer.addEventListener("submit", (e) => {
   startRun();
 });
 
+workdirInput.addEventListener("change", () => {
+  workdirInput.dataset.touched = "1";
+  loadFileTree();
+});
 workdirInput.addEventListener("input", () => {
   workdirInput.dataset.touched = "1";
 });
@@ -576,6 +959,28 @@ document.querySelector('.nav-item[data-view="home"]').addEventListener("click", 
 
 document.getElementById("btnRefreshHistory").addEventListener("click", loadHistory);
 document.getElementById("btnResetDemos").addEventListener("click", resetDemos);
+document.getElementById("btnOpenFolder").addEventListener("click", openFolderModal);
+document.getElementById("btnFolderGo").addEventListener("click", () => browseFolder(folderPathInput.value.trim()));
+document.getElementById("btnFolderSelect").addEventListener("click", selectFolder);
+document.getElementById("btnToggleRight").addEventListener("click", () => {
+  workspace.classList.toggle("right-collapsed");
+});
+
+document.querySelectorAll(".rp-tab").forEach((tab) => {
+  tab.addEventListener("click", () => switchRightTab(tab.dataset.tab));
+});
+
+document.querySelectorAll("[data-close]").forEach((el) => {
+  el.addEventListener("click", () => closeModal(el.getAttribute("data-close")));
+});
+
+folderPathInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    browseFolder(folderPathInput.value.trim());
+  }
+});
+
 historySearch.addEventListener("input", () => renderHistory(historyCache));
 
 loadMeta();

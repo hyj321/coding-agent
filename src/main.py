@@ -55,6 +55,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max messages kept in model context (default: MAX_MESSAGES env or 40).",
     )
     p.add_argument(
+        "--context-budget",
+        type=int,
+        default=None,
+        help="Approx token budget for Context Manager (default: CONTEXT_TOKEN_BUDGET or 8000).",
+    )
+    p.add_argument(
         "--transcript-dir",
         default=None,
         help="Directory for JSON transcripts (default: transcripts/). Use 'off' to disable.",
@@ -73,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
             approval=args.approval,
             transcript_dir=args.transcript_dir,
             max_messages=args.max_messages,
+            context_token_budget=args.context_budget,
         )
     except ValueError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
@@ -94,7 +101,11 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"[config] workdir={config.workdir}")
     print(f"[config] base_url={config.base_url} model={config.model}")
-    print(f"[config] approval={config.approval.value} max_messages={config.max_messages}")
+    print(
+        f"[config] approval={config.approval.value} "
+        f"max_messages={config.max_messages} "
+        f"context_budget≈{config.context_token_budget}"
+    )
 
     result = run_agent(
         client=client,
@@ -104,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
         max_steps=config.max_steps,
         gate=gate,
         max_messages=config.max_messages,
+        context_token_budget=config.context_token_budget,
     )
 
     if config.transcript_dir is not None:

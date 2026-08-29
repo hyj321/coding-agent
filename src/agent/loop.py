@@ -1,4 +1,4 @@
-"""Agent loop: call model → authorize → dispatch tools → append → trim → repeat."""
+"""Agent loop: call model → authorize → dispatch tools → append → compress → repeat."""
 
 from __future__ import annotations
 
@@ -7,7 +7,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from src.agent.context import trim_messages
+from src.agent.context import ContextManager, trim_messages
+from src.agent.memory import append_run_to_memory
 from src.agent.permissions import PermissionGate
 from src.llm.client import LLMClient
 from src.tools.base import ToolRegistry
@@ -26,6 +27,7 @@ class AgentResult:
     steps: int
     stopped_reason: str  # completed | max_steps | interrupted
     messages: list[dict[str, Any]] = field(default_factory=list)
+    memory: dict[str, Any] | None = None
 
 
 def _message_to_dict(message: Any) -> dict[str, Any]:
@@ -96,6 +98,28 @@ def _parse_todo_lines(result: str) -> list[dict[str, str]] | None:
     return items or None
 
 
+_MUTATING_FILE_TOOLS = frozenset({"write_file", "edit_file"})
+_FILE_DIFF_LIMIT = 120_000
+
+
+def _snapshot_text(path: Any) -> str | None:
+    """Read UTF-8 text for diff; None if missing / binary / unreadable."""
+    try:
+        if not path.exists() or not path.is_file():
+            return None
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _clip_diff(text: str | None) -> str | None:
+    if text is None:
+        return None
+    if len(text) <= _FILE_DIFF_LIMIT:
+        return text
+    return text[:_FILE_DIFF_LIMIT] + f"\n...[truncated for UI, total {len(text)} chars]"
+
+
 def run_agent(
     *,
     client: LLMClient,
@@ -107,24 +131,65 @@ def run_agent(
     max_messages: int = 40,
     log: LogFn | None = None,
     on_event: EventFn | None = None,
+    prior_messages: list[dict[str, Any]] | None = None,
+    prior_memory: dict[str, Any] | None = None,
+    context_token_budget: int | None = None,
+    context_manager: ContextManager | None = None,
+    persist_memory_md: bool = True,
 ) -> AgentResult:
-    """Core harness loop. Extensible: swap registry / client / gate without changing this."""
+    """Core harness loop with ACON-inspired Context Manager.
+
+    prior_messages: slim prior session history for multi-turn continue
+      (prefer memory + recent K + original task; not the full dump).
+    prior_memory: ContextManager.export_memory() from the previous turn.
+    ContextManager: observation compression + layered fold when over token budget.
+    """
     log = log or _default_log
 
     def emit(event: dict[str, Any]) -> None:
         if on_event is not None:
             on_event(event)
 
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_task},
-    ]
+    workdir = gate.workdir if gate is not None else getattr(client.config, "workdir", None)
+    ctx = context_manager
+    if ctx is None and workdir is not None:
+        budget = context_token_budget
+        if budget is None:
+            budget = int(getattr(client.config, "context_token_budget", 8000) or 8000)
+        ctx = ContextManager(
+            workdir=workdir,
+            tool_names=registry.names(),
+            token_budget=budget,
+            recent_keep_messages=max(8, min(max_messages // 2, 20)),
+        )
+        system_prompt = ctx.build_system_prompt()
+
+    if ctx is not None and prior_memory:
+        ctx.import_memory(prior_memory)
+
+    if prior_messages:
+        messages = [m for m in prior_messages if m.get("role") != "system"]
+        messages.insert(0, {"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_task})
+    else:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_task},
+        ]
+    if ctx is not None:
+        ctx.state.task = user_task
     tools = registry.openai_tools()
 
     log(f"[agent] model={client.config.model} max_steps={max_steps}")
     log(f"[agent] tools={', '.join(registry.names())}")
     if gate is not None:
         log(f"[agent] approval={gate.approval.value}")
+    if ctx is not None:
+        log(f"[agent] context_budget≈{ctx.token_budget} tokens (ACON-style manager)")
+        if ctx.state.project_memory:
+            log("[agent] loaded Project Memory from MEMORY.md")
+        if prior_memory:
+            log("[agent] hydrated working memory from prior session snapshot")
     log(f"[agent] task={user_task!r}")
     emit(
         {
@@ -133,15 +198,34 @@ def run_agent(
             "max_steps": max_steps,
             "tools": registry.names(),
             "task": user_task,
+            "context_token_budget": ctx.token_budget if ctx is not None else None,
+            "has_project_memory": bool(ctx and ctx.state.project_memory),
         }
     )
+
+    def _finish(result: AgentResult) -> AgentResult:
+        if persist_memory_md and ctx is not None and workdir is not None:
+            mem_path = append_run_to_memory(
+                workdir,
+                task=user_task,
+                final_text=result.final_text,
+                stopped_reason=result.stopped_reason,
+                memory=result.memory,
+            )
+            if mem_path is not None:
+                log(f"[memory] appended → {mem_path}")
+                emit({"type": "memory_write", "path": str(mem_path)})
+        return result
 
     try:
         for step in range(1, max_steps + 1):
             log(f"\n=== step {step}/{max_steps} ===")
             emit({"type": "step_start", "step": step, "max_steps": max_steps})
-            messages = trim_messages(messages, max_messages=max_messages)
-            response = client.chat(messages, tools=tools)
+            if ctx is not None:
+                model_messages = ctx.prepare_messages(messages, user_task=user_task)
+            else:
+                model_messages = trim_messages(messages, max_messages=max_messages)
+            response = client.chat(model_messages, tools=tools)
             choice = response.choices[0]
             message = choice.message
             assistant_dict = _message_to_dict(message)
@@ -153,11 +237,14 @@ def run_agent(
                 log(f"[agent] final:\n{final}")
                 emit({"type": "final", "step": step, "text": final, "stopped_reason": "completed"})
                 emit({"type": "step_end", "step": step, "kind": "final"})
-                return AgentResult(
-                    final_text=final,
-                    steps=step,
-                    stopped_reason="completed",
-                    messages=messages,
+                return _finish(
+                    AgentResult(
+                        final_text=final,
+                        steps=step,
+                        stopped_reason="completed",
+                        messages=messages,
+                        memory=ctx.export_memory() if ctx is not None else None,
+                    )
                 )
 
             if assistant_dict.get("content"):
@@ -183,6 +270,23 @@ def run_agent(
                 )
 
                 parsed = _parse_args(raw_args)
+                before_text: str | None = None
+                rel_path: str | None = None
+                resolved_path = None
+                if (
+                    name in _MUTATING_FILE_TOOLS
+                    and gate is not None
+                    and isinstance(parsed, dict)
+                    and parsed.get("path")
+                ):
+                    try:
+                        resolved_path = gate.resolve_path(str(parsed["path"]))
+                        rel_path = resolved_path.relative_to(gate.workdir).as_posix()
+                        before_text = _snapshot_text(resolved_path)
+                    except (OSError, ValueError):
+                        resolved_path = None
+                        rel_path = str(parsed.get("path") or "")
+
                 if isinstance(parsed, str):
                     result = parsed
                 elif gate is not None:
@@ -195,8 +299,17 @@ def run_agent(
                 else:
                     result = registry.dispatch(name, parsed)
 
+                stored = result
+                if ctx is not None:
+                    stored = ctx.observe_tool(
+                        step=step,
+                        tool_name=name,
+                        raw_args=parsed if isinstance(parsed, dict) else raw_args,
+                        result=result,
+                    )
+
                 ok = not str(result).startswith("Error")
-                result_summary = _summarize_result(result)
+                result_summary = _summarize_result(stored)
                 log(f"[result] {result_summary}")
                 emit(
                     {
@@ -205,20 +318,37 @@ def run_agent(
                         "id": call_id,
                         "name": name,
                         "ok": ok,
-                        "result": result if len(result) <= 4000 else result[:4000] + "\n...[truncated]",
+                        "result": stored if len(stored) <= 4000 else stored[:4000] + "\n...[truncated]",
                         "result_summary": result_summary,
+                        "compressed": stored != result,
                     }
                 )
                 if name == "todo_write":
                     todos = _parse_todo_lines(result)
                     if todos is not None:
                         emit({"type": "todo_update", "step": step, "todos": todos})
+                if ok and name in _MUTATING_FILE_TOOLS and rel_path is not None:
+                    after_text = _snapshot_text(resolved_path) if resolved_path is not None else None
+                    if after_text is None and isinstance(parsed, dict) and "content" in parsed:
+                        after_text = str(parsed.get("content") or "")
+                    emit(
+                        {
+                            "type": "file_change",
+                            "step": step,
+                            "id": call_id,
+                            "tool": name,
+                            "path": rel_path,
+                            "old_content": _clip_diff(before_text if before_text is not None else ""),
+                            "new_content": _clip_diff(after_text if after_text is not None else ""),
+                            "is_new": before_text is None,
+                        }
+                    )
 
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call_id,
-                        "content": result,
+                        "content": stored,
                     }
                 )
 
@@ -227,20 +357,26 @@ def run_agent(
         log(f"[agent] stopped: reached max_steps={max_steps}")
         final = f"(stopped after {max_steps} steps without a final answer)"
         emit({"type": "final", "step": max_steps, "text": final, "stopped_reason": "max_steps"})
-        return AgentResult(
-            final_text=final,
-            steps=max_steps,
-            stopped_reason="max_steps",
-            messages=messages,
+        return _finish(
+            AgentResult(
+                final_text=final,
+                steps=max_steps,
+                stopped_reason="max_steps",
+                messages=messages,
+                memory=ctx.export_memory() if ctx is not None else None,
+            )
         )
     except KeyboardInterrupt:
         log("\n[agent] interrupted by user")
         emit({"type": "error", "message": "interrupted by user", "stopped_reason": "interrupted"})
-        return AgentResult(
-            final_text="(interrupted)",
-            steps=0,
-            stopped_reason="interrupted",
-            messages=messages,
+        return _finish(
+            AgentResult(
+                final_text="(interrupted)",
+                steps=0,
+                stopped_reason="interrupted",
+                messages=messages,
+                memory=ctx.export_memory() if ctx is not None else None,
+            )
         )
     except Exception as exc:
         emit({"type": "error", "message": f"{type(exc).__name__}: {exc}"})

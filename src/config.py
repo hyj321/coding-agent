@@ -20,6 +20,7 @@ class Config:
     max_steps: int
     max_tool_output_chars: int = 8000
     max_messages: int = 40
+    context_token_budget: int = 8000
     approval: ApprovalMode = ApprovalMode.AUTO
     transcript_dir: Path | None = None
 
@@ -33,6 +34,7 @@ class Config:
         approval: str | None = None,
         transcript_dir: str | Path | None = None,
         max_messages: int | None = None,
+        context_token_budget: int | None = None,
     ) -> Config:
         load_dotenv()
 
@@ -71,6 +73,14 @@ class Config:
         if keep < 4:
             raise ValueError("MAX_MESSAGES must be >= 4")
 
+        token_budget = (
+            context_token_budget
+            if context_token_budget is not None
+            else int(os.getenv("CONTEXT_TOKEN_BUDGET", "8000"))
+        )
+        if token_budget < 1500:
+            raise ValueError("CONTEXT_TOKEN_BUDGET must be >= 1500")
+
         mode = parse_approval_mode(approval or os.getenv("APPROVAL") or "auto")
 
         tdir_raw = transcript_dir if transcript_dir is not None else os.getenv("TRANSCRIPT_DIR")
@@ -89,6 +99,7 @@ class Config:
             max_steps=steps,
             max_tool_output_chars=max_out,
             max_messages=keep,
+            context_token_budget=token_budget,
             approval=mode,
             transcript_dir=tdir,
         )

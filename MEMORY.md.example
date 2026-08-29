@@ -1,0 +1,15 @@
+# Project Memory
+
+Cross-run notes for the coding agent (facts, conventions, pitfalls, what changed).
+Copy to `MEMORY.md` (or `.agent/MEMORY.md`) under the workdir, or let the agent
+create it automatically after the first completed run.
+
+Newest entries are appended at the bottom; the agent injects a recent excerpt
+into Current State at the start of each task.
+
+---
+
+## Example (hand-written conventions)
+
+- Prefer `edit_file` over rewriting whole files.
+- Demo tests live next to the module (`greeter_test.py`).

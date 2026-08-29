@@ -7,54 +7,57 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=20260829e" />
+  <link rel="stylesheet" href="/static/styles.css?v=20260829g" />
   <script src="https://cdn.jsdelivr.net/npm/marked@15.0.7/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js"></script>
 </head>
 <body>
   <div class="app">
     <aside class="sidebar">
-      <div class="brand">
-        <div class="brand-mark" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="none">
-            <rect x="4" y="5" width="16" height="14" rx="4" stroke="url(#g)" stroke-width="1.8"/>
-            <circle cx="9" cy="11" r="1.3" fill="url(#g)"/>
-            <circle cx="15" cy="11" r="1.3" fill="url(#g)"/>
-            <path d="M9 15h6" stroke="url(#g)" stroke-width="1.6" stroke-linecap="round"/>
-            <defs>
-              <linearGradient id="g" x1="4" y1="5" x2="20" y2="19">
-                <stop stop-color="#7B5CFF"/><stop offset="1" stop-color="#FF6BCB"/>
-              </linearGradient>
-            </defs>
-          </svg>
+      <div class="sidebar-top">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none">
+              <rect x="4" y="5" width="16" height="14" rx="4" stroke="url(#g)" stroke-width="1.8"/>
+              <circle cx="9" cy="11" r="1.3" fill="url(#g)"/>
+              <circle cx="15" cy="11" r="1.3" fill="url(#g)"/>
+              <path d="M9 15h6" stroke="url(#g)" stroke-width="1.6" stroke-linecap="round"/>
+              <defs>
+                <linearGradient id="g" x1="4" y1="5" x2="20" y2="19">
+                  <stop stop-color="#7B5CFF"/><stop offset="1" stop-color="#FF6BCB"/>
+                </linearGradient>
+              </defs>
+            </svg>
+          </div>
+          <span class="brand-name">CodeAgent</span>
         </div>
-        <span class="brand-name">CodeAgent</span>
+
+        <label class="search">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>
+          </svg>
+          <input id="historySearch" type="search" placeholder="Search chats" />
+        </label>
+
+        <nav class="nav">
+          <button class="nav-item active" data-view="home" type="button">
+            <span class="nav-icon">✦</span> Explore
+          </button>
+          <button class="nav-item" id="btnNew" type="button">
+            <span class="nav-icon">＋</span> New task
+          </button>
+          <button class="nav-item" id="btnResetDemos" type="button">
+            <span class="nav-icon">↺</span> Reset demos
+          </button>
+          <a class="nav-item" href="https://github.com/hyj321/coding-agent" target="_blank" rel="noreferrer">
+            <span class="nav-icon">⧉</span> GitHub
+          </a>
+          <button class="nav-item" id="btnRefreshHistory" type="button">
+            <span class="nav-icon">↻</span> History
+          </button>
+        </nav>
       </div>
-
-      <label class="search">
-        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>
-        </svg>
-        <input id="historySearch" type="search" placeholder="Search chats" />
-      </label>
-
-      <nav class="nav">
-        <button class="nav-item active" data-view="home" type="button">
-          <span class="nav-icon">✦</span> Explore
-        </button>
-        <button class="nav-item" id="btnNew" type="button">
-          <span class="nav-icon">＋</span> New task
-        </button>
-        <button class="nav-item" id="btnResetDemos" type="button">
-          <span class="nav-icon">↺</span> Reset demos
-        </button>
-        <a class="nav-item" href="https://github.com/hyj321/coding-agent" target="_blank" rel="noreferrer">
-          <span class="nav-icon">⧉</span> GitHub
-        </a>
-        <button class="nav-item" id="btnRefreshHistory" type="button">
-          <span class="nav-icon">↻</span> History
-        </button>
-      </nav>
 
       <div class="recent-block">
         <div class="recent-label">RECENT CHATS</div>
@@ -70,10 +73,18 @@
 
     <main class="main">
       <header class="topbar">
-        <button class="model-pill" type="button" title="Model from .env / request">
-          CodeAgent · DeepSeek
-          <span class="chev">▾</span>
-        </button>
+        <div class="topbar-left">
+          <button class="model-pill" type="button" title="Model from .env / request">
+            CodeAgent · DeepSeek
+            <span class="chev">▾</span>
+          </button>
+          <button id="btnOpenFolder" class="open-folder-btn" type="button" title="Open a folder as workdir">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M3 7h6l2 2h10v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" stroke-linejoin="round"/>
+            </svg>
+            Open folder
+          </button>
+        </div>
         <div class="topbar-right">
           <div id="runStatus" class="run-status idle">Idle</div>
           <div class="user">
@@ -96,12 +107,28 @@
 
           <section id="chatView" class="chat hidden">
             <div id="timeline" class="timeline"></div>
+            <!-- Moved into timeline after FINAL by JS; kept here as template -->
+            <div id="changedBar" class="changed-bar hidden">
+              <div class="changed-label">Changed files</div>
+              <div id="changedList" class="changed-list"></div>
+            </div>
           </section>
         </div>
 
-        <aside id="todoPanel" class="todo-panel hidden">
-          <div class="todo-panel-title">Plan</div>
-          <div id="todoList" class="todo-list"></div>
+        <aside id="rightPanel" class="right-panel">
+          <div class="right-panel-tabs">
+            <button type="button" class="rp-tab active" data-tab="files">Files</button>
+            <button type="button" class="rp-tab" data-tab="plan">Plan</button>
+            <button type="button" id="btnToggleRight" class="rp-collapse" title="Collapse">⟨</button>
+          </div>
+          <div id="filesPane" class="rp-pane">
+            <div id="filesWorkdir" class="files-workdir"></div>
+            <div id="fileTree" class="file-tree"></div>
+          </div>
+          <div id="planPane" class="rp-pane hidden">
+            <div id="todoList" class="todo-list"></div>
+            <div id="todoEmpty" class="todo-empty">No plan yet — agent will use todo_write.</div>
+          </div>
         </aside>
       </div>
 
@@ -124,10 +151,59 @@
             </svg>
           </button>
         </form>
-        <p class="foot-note">Local coding agent · structured tool steps · demos in <code>/demos</code></p>
+        <p class="foot-note">Local coding agent · one chat = one session history · demos in <code>/demos</code></p>
       </footer>
     </main>
   </div>
-  <script src="/static/app.js?v=20260829e"></script>
+
+  <!-- Open folder modal -->
+  <div id="folderModal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-backdrop" data-close="folder"></div>
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2>Open folder</h2>
+        <button type="button" class="modal-x" data-close="folder">×</button>
+      </div>
+      <div class="folder-path-row">
+        <input id="folderPathInput" type="text" />
+        <button type="button" id="btnFolderGo" class="btn-secondary">Go</button>
+      </div>
+      <div id="folderListing" class="folder-listing"></div>
+      <div class="modal-actions">
+        <button type="button" class="btn-secondary" data-close="folder">Cancel</button>
+        <button type="button" id="btnFolderSelect" class="btn-primary">Use this folder</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- VS Code-style code / diff viewer (Monaco) -->
+  <div id="codeModal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-backdrop" data-close="code"></div>
+    <div class="modal-card modal-code">
+      <div class="vscode-titlebar">
+        <div class="vscode-dots" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div id="codeTitle" class="vscode-title">file</div>
+        <div class="vscode-title-actions">
+          <span id="codeModeBadge" class="vscode-badge">Preview</span>
+          <button type="button" class="modal-x vscode-x" data-close="code">×</button>
+        </div>
+      </div>
+      <div class="vscode-tabbar">
+        <div id="codeTab" class="vscode-tab active">
+          <span class="vscode-tab-icon">📄</span>
+          <span id="codeTabName">file</span>
+        </div>
+      </div>
+      <div id="monacoHost" class="monaco-host"></div>
+      <div class="vscode-statusbar">
+        <span id="codeLangLabel">plaintext</span>
+        <span>UTF-8</span>
+        <span>LF</span>
+        <span id="codeStatusRight">Monaco · VS Code engine</span>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=20260829g"></script>
 </body>
 </html>
