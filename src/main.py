@@ -1,0 +1,93 @@
+"""CLI entry: python -m src.main \"your task\"."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+
+from src.agent.context import build_system_prompt
+from src.agent.loop import run_agent
+from src.agent.permissions import PermissionGate
+from src.config import Config
+from src.llm.client import LLMClient
+from src.tools import build_default_registry
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="codeagent",
+        description="Minimal extensible coding agent (DeepSeek tool calling + local tools).",
+    )
+    p.add_argument(
+        "task",
+        nargs="?",
+        help="Programming task for the agent. If omitted, read from stdin / prompt.",
+    )
+    p.add_argument(
+        "-w",
+        "--workdir",
+        default=None,
+        help="Working directory sandbox root (default: WORKDIR env or .).",
+    )
+    p.add_argument(
+        "-m",
+        "--model",
+        default=None,
+        help="Model id (default: MODEL env or deepseek-v4-flash).",
+    )
+    p.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Max model/tool iterations (default: MAX_STEPS env or 20).",
+    )
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    try:
+        config = Config.from_env(
+            workdir=args.workdir,
+            model=args.model,
+            max_steps=args.max_steps,
+        )
+    except ValueError as exc:
+        print(f"Config error: {exc}", file=sys.stderr)
+        return 2
+
+    task = args.task
+    if not task:
+        print("Enter task (end with empty line / Ctrl+Z on Windows then Enter):")
+        lines = sys.stdin.read().strip()
+        task = lines
+    if not task:
+        print("No task provided.", file=sys.stderr)
+        return 2
+
+    gate = PermissionGate(config.workdir)
+    registry = build_default_registry(gate, max_output_chars=config.max_tool_output_chars)
+    system_prompt = build_system_prompt(config.workdir, registry.names())
+    client = LLMClient(config)
+
+    print(f"[config] workdir={config.workdir}")
+    print(f"[config] base_url={config.base_url} model={config.model}")
+
+    result = run_agent(
+        client=client,
+        registry=registry,
+        system_prompt=system_prompt,
+        user_task=task,
+        max_steps=config.max_steps,
+    )
+
+    print("\n========== RESULT ==========")
+    print(f"stopped_reason: {result.stopped_reason}")
+    print(f"steps: {result.steps}")
+    print(result.final_text)
+    return 0 if result.stopped_reason == "completed" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
