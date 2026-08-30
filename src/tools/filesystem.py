@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 from typing import Any
@@ -10,8 +11,9 @@ from src.agent.permissions import PermissionGate
 from src.tools.fs_noise import is_noise_entry
 from src.tools.base import FunctionTool, ToolRegistry
 
-# Soft hint when a full-file read is large (encourages offset/limit next time)
-_LARGE_FILE_LINES = 200
+# Cap-A / SWE-agent style viewer: long files without offset → head window only
+_AUTO_HEAD_MIN_LINES = 100
+_AUTO_HEAD_LINES = 100
 _DEFAULT_GREP_MAX_MATCHES = 50
 _DEFAULT_GREP_MAX_FILES = 80
 _BINARY_SAMPLE = 8192
@@ -40,6 +42,24 @@ def _is_probably_text(path: Path) -> bool:
     if b"\x00" in chunk:
         return False
     return True
+
+
+def _python_syntax_error(path: Path, content: str) -> str | None:
+    """Return an Error message if path is .py and content fails ast.parse; else None."""
+    if path.suffix.lower() != ".py":
+        return None
+    try:
+        ast.parse(content)
+    except SyntaxError as exc:
+        loc = f"line {exc.lineno}" if exc.lineno else "unknown line"
+        msg = exc.msg or "invalid syntax"
+        rel = path.name
+        return (
+            f"Error: syntax rejected for {rel} ({loc}): {msg}. "
+            "File was NOT modified. Fix the snippet and retry."
+        )
+    return None
+
 
 
 def register_filesystem_tools(
@@ -72,14 +92,18 @@ def register_filesystem_tools(
         total = len(lines)
 
         if offset is None and limit is None:
-            if total >= _LARGE_FILE_LINES:
+            if total >= _AUTO_HEAD_MIN_LINES:
                 rel = path.relative_to(gate.workdir).as_posix()
+                head_n = min(_AUTO_HEAD_LINES, total)
+                body = "".join(lines[:head_n])
+                next_off = head_n + 1
                 header = (
-                    f"# {rel} — {total} lines (full)\n"
-                    f"# Hint: file is long; prefer read_file with offset/limit "
-                    f"(e.g. offset=1, limit=80) or use grep.\n"
+                    f"# {rel} — lines 1-{head_n} of {total} "
+                    f"(auto-head; full read omitted)\n"
+                    f"# Continue: read_file path={rel!r} offset={next_off} "
+                    f"limit={_AUTO_HEAD_LINES} — or grep for a symbol first.\n"
                 )
-                return _truncate(header + content, max_output_chars)
+                return _truncate(header + body, max_output_chars)
             return _truncate(content, max_output_chars)
 
         start = (offset or 1) - 1  # 0-based
@@ -104,9 +128,13 @@ def register_filesystem_tools(
         content = args.get("content")
         if content is None:
             return "Error: missing required argument 'content'"
+        text = str(content)
+        syntax_err = _python_syntax_error(path, text)
+        if syntax_err is not None:
+            return syntax_err
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(str(content), encoding="utf-8")
-        return f"Wrote {len(str(content))} chars to {path.relative_to(gate.workdir)}"
+        path.write_text(text, encoding="utf-8")
+        return f"Wrote {len(text)} chars to {path.relative_to(gate.workdir)}"
 
     def list_dir(args: dict[str, Any]) -> str:
         rel = args.get("path") or "."
@@ -163,6 +191,9 @@ def register_filesystem_tools(
                 "Provide a more specific old_string, or set replace_all=true."
             )
         updated = content.replace(old_s, new_s) if replace_all else content.replace(old_s, new_s, 1)
+        syntax_err = _python_syntax_error(path, updated)
+        if syntax_err is not None:
+            return syntax_err
         path.write_text(updated, encoding="utf-8")
         rel = path.relative_to(gate.workdir).as_posix()
         n = count if replace_all else 1
@@ -275,8 +306,9 @@ def register_filesystem_tools(
             name="read_file",
             description=(
                 "Read a UTF-8 text file under the working directory. "
-                "Optional offset/limit (1-based line numbers) to read a slice — "
-                "prefer slicing for long files instead of loading everything."
+                "Prefer grep first to locate, then offset/limit for a slice. "
+                "Without offset/limit, files ≥100 lines return only an auto-head "
+                "(first 100 lines) plus a continue hint — not the full file."
             ),
             parameters={
                 "type": "object",
@@ -306,7 +338,8 @@ def register_filesystem_tools(
             name="write_file",
             description=(
                 "Create or overwrite a UTF-8 text file under the working directory. "
-                "Creates parent directories if needed."
+                "Creates parent directories if needed. "
+                "For .py files, content must parse with ast; syntax errors leave the file unchanged."
             ),
             parameters={
                 "type": "object",
@@ -352,7 +385,8 @@ def register_filesystem_tools(
             description=(
                 "Replace an exact substring in an existing UTF-8 file. "
                 "Prefer this over write_file for small, precise edits. "
-                "old_string must match exactly (including whitespace)."
+                "old_string must match exactly (including whitespace). "
+                "For .py files, the result must parse with ast; on syntax error the file is unchanged."
             ),
             parameters={
                 "type": "object",

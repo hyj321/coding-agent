@@ -20,7 +20,9 @@ python -m src.main -w demos --approval auto --max-steps 20 "阅读 greeter_test.
 |------|------|
 | 改造前参考 | 常见 5～15 步（细 todo / 单工具空步会偏高） |
 | P0 目标 | 同任务 steps 下降；少「只 todo_write」的空步；撞 `max_steps` 变少 |
-| 记录方式 | 看 CLI 最后 `steps=` 或 transcript；对比改造前后 |
+| 记录方式 | CLI `steps=` / transcript；或 `python -m scripts.run_capability_eval --live` |
+
+验证优先用 `run_tests target=greeter_test.py`（Cap-B）；完整 Capability 评测见质量文档 §2.7 Cap-C。
 
 ## 备用演示（更短）
 

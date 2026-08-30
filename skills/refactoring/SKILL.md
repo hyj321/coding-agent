@@ -9,6 +9,8 @@ Follow this playbook. Prefer tools over guessing.
 
 **Same turn:** If not preloaded, `load_skill("refactoring")` + `todo_write` (3–5 phases) + first reads. Do not plan alone.
 
+**Plan-then-act:** Always `todo_write` for multi-file or multi-step structure work; re-test after each phase.
+
 1. **Baseline** — Locate related tests; run them first (`run_shell`). If already failing, switch to **debugging**.
 2. **Scope** — One sentence: what structure changes, what must stay identical.
 3. **Plan** — `todo_write`: baseline → small edit → re-test → repeat. Keep one `in_progress`.

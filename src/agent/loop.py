@@ -37,6 +37,7 @@ from src.agent.stop_conditions import (
     reasons_allow_force_stop,
     should_force_stop_after_nudge,
 )
+from src.agent.task_budget import TaskBudget
 from src.agent.tool_visibility import infer_phase, visible_tool_names
 from src.llm.client import LLMClient
 from src.tools.base import ToolRegistry
@@ -45,6 +46,7 @@ from src.tools.base import ToolRegistry
 __all__ = [
     "AgentResult",
     "LoopGuard",
+    "TaskBudget",
     "run_agent",
     "tool_call_fingerprint",
 ]
@@ -61,7 +63,7 @@ def _default_log(msg: str) -> None:
 class AgentResult:
     final_text: str
     steps: int
-    stopped_reason: str  # completed | max_steps | interrupted | loop_detected | retry_exhausted | goal_met_forced
+    stopped_reason: str  # completed | max_steps | interrupted | loop_detected | cycle_detected | stagnation_detected | retry_exhausted | goal_met_forced | budget_exhausted
     messages: list[dict[str, Any]] = field(default_factory=list)
     memory: dict[str, Any] | None = None
 
@@ -175,6 +177,7 @@ def run_agent(
     transcript_dir: Path | None = None,
     cancel_event: Any | None = None,
     steer_inbox: SteerInbox | None = None,
+    max_task_tokens: int | None = None,
 ) -> AgentResult:
     """Core harness loop with ACON-inspired Context Manager.
 
@@ -318,10 +321,24 @@ def run_agent(
     tool_visibility = str(getattr(cfg, "tool_visibility", "auto") or "auto")
     completion_mode = str(getattr(cfg, "completion_mode", "evidence") or "evidence")
     evidence_nudge_max = int(getattr(cfg, "evidence_nudge_max", 2) or 2)
+    task_tok_cap = (
+        int(max_task_tokens)
+        if max_task_tokens is not None
+        else int(getattr(cfg, "max_task_tokens", 0) or 0)
+    )
+    out_reserve = int(getattr(cfg, "task_token_output_reserve", 512) or 512)
+    task_budget = TaskBudget(max_task_tokens=task_tok_cap, output_reserve=out_reserve)
     log(
         f"[agent] tool_visibility={tool_visibility} "
         f"completion_mode={completion_mode} evidence_nudge_max={evidence_nudge_max}"
     )
+    if task_budget.enabled:
+        log(
+            f"[agent] max_task_tokens={task_budget.max_task_tokens} "
+            f"(output_reserve={task_budget.output_reserve}; Cost-A hard gate ON)"
+        )
+    else:
+        log("[agent] max_task_tokens=0 (Cost-A hard gate OFF)")
     if ctx is not None:
         log(f"[agent] context_budget≈{ctx.token_budget} tokens (ACON-style manager)")
         if ctx.state.project_memory:
@@ -341,6 +358,7 @@ def run_agent(
             "tools": registry.names(),
             "task": user_task,
             "context_token_budget": ctx.token_budget if ctx is not None else None,
+            "max_task_tokens": task_budget.max_task_tokens if task_budget.enabled else 0,
             "has_project_memory": bool(ctx and ctx.state.project_memory),
             "prompt_layout": ctx.state.layout_mode if ctx is not None else None,
             "preloaded_skill": preloaded_skill,
@@ -366,6 +384,10 @@ def run_agent(
     log(
         f"[agent] loop_guard warn={loop_guard.warn_after} "
         f"stop={loop_guard.stop_after} error_nudge={loop_guard.error_nudge_after} "
+        f"cycle_warn={loop_guard.cycle_warn_repeats} "
+        f"cycle_stop={loop_guard.cycle_stop_repeats} "
+        f"stag_warn={loop_guard.stagnation_warn_after} "
+        f"stag_stop={loop_guard.stagnation_stop_after} "
         f"retry_max={retry_max} final_nudge_mutating_limit={nudge_mutating_limit}"
     )
 
@@ -378,6 +400,19 @@ def run_agent(
                 result.memory = ctx.export_memory()
             if isinstance(result.memory, dict) and usage is not None:
                 result.memory["context_usage"] = usage
+            if usage is not None:
+                task_budget.note_context_usage(usage.get("used_tokens"))
+        if result.memory is None:
+            result.memory = {}
+        cost = task_budget.cost_report(
+            steps=result.steps,
+            max_steps=max_steps,
+            stopped_reason=result.stopped_reason,
+        )
+        if isinstance(result.memory, dict):
+            result.memory["task_budget"] = task_budget.snapshot()
+            result.memory["cost_report"] = cost
+        emit({"type": "cost_report", **cost})
         if ctx is not None and workdir is not None and result.memory is not None:
             wm_path = save_working_memory(
                 workdir,
@@ -423,6 +458,40 @@ def run_agent(
             log("[memory] turn summary written")
         return result
 
+    def _budget_stop(step: int, decision: dict[str, Any], messages: list[dict[str, Any]]) -> AgentResult:
+        final = task_budget.stop_message(decision)
+        log(
+            f"[agent] stopped: budget_exhausted kind={decision.get('budget_kind')} "
+            f"used≈{decision.get('tokens_used')}/{decision.get('max_task_tokens')} "
+            f"projected≈{decision.get('projected')} (no further LLM call)"
+        )
+        emit(
+            {
+                "type": "budget_exhausted",
+                "step": step,
+                **{k: v for k, v in decision.items() if k != "allow"},
+            }
+        )
+        emit(
+            {
+                "type": "final",
+                "step": step,
+                "text": final,
+                "stopped_reason": "budget_exhausted",
+                "budget_kind": decision.get("budget_kind"),
+            }
+        )
+        emit({"type": "step_end", "step": step, "kind": "budget_exhausted"})
+        return _finish(
+            AgentResult(
+                final_text=final,
+                steps=step,
+                stopped_reason="budget_exhausted",
+                messages=messages,
+                memory=ctx.export_memory() if ctx is not None else None,
+            )
+        )
+
     try:
         for step in range(1, max_steps + 1):
             if is_cancelled(cancel_event):
@@ -432,6 +501,18 @@ def run_agent(
 
             log(f"\n=== step {step}/{max_steps} ===")
             emit({"type": "step_start", "step": step, "max_steps": max_steps})
+
+            # Cost-B: budget awareness in Current State + one-shot ≤20% warn
+            if ctx is not None:
+                ctx.state.budget_line = task_budget.format_line(step=step, max_steps=max_steps)
+            warn_msg = task_budget.maybe_warn_message(
+                step=max(0, step - 1),
+                max_steps=max_steps,
+            )
+            if warn_msg:
+                messages.append({"role": "user", "content": warn_msg})
+                log(f"[budget] {warn_msg[:120]}")
+                emit({"type": "budget_warn", "step": step, "text": warn_msg})
 
             # Least-privilege: narrow visible tools from todo phase (optional)
             if tool_visibility == "auto":
@@ -467,9 +548,27 @@ def run_agent(
 
             if ctx is not None:
                 model_messages = ctx.prepare_messages(messages, user_task=user_task)
-                emit({"type": "context_usage", **ctx.usage_report(model_messages, scope="turn")})
+                usage_evt = ctx.usage_report(model_messages, scope="turn")
+                emit({"type": "context_usage", **usage_evt})
+                task_budget.note_context_usage(
+                    usage_evt.get("used_tokens"),
+                    compress_events=int(getattr(ctx.state, "compress_events", 0) or 0)
+                    + int(getattr(ctx.state, "fold_events", 0) or 0)
+                    + int(getattr(ctx.state, "microcompact_events", 0) or 0),
+                )
             else:
                 model_messages = trim_messages(messages, max_messages=max_messages)
+
+            # Cost-A: sync token gate BEFORE the provider call
+            deny = task_budget.check_before_llm(model_messages)
+            if deny is not None:
+                # Stop before this LLM call; steps = completed LLM rounds so far
+                return _budget_stop(
+                    step=max(0, task_budget.llm_calls),
+                    decision=deny,
+                    messages=messages,
+                )
+
             response = client.chat(model_messages, tools=tools)
             if is_cancelled(cancel_event):
                 return _interrupt_result(step=step, messages=messages)
@@ -477,6 +576,20 @@ def run_agent(
             message = choice.message
             assistant_dict = _message_to_dict(message)
             messages.append(assistant_dict)
+            task_budget.record_llm_turn(
+                messages=model_messages,
+                response=response,
+                assistant_message=assistant_dict,
+            )
+            emit(
+                {
+                    "type": "task_budget",
+                    "step": step,
+                    "max_steps": max_steps,
+                    "line": task_budget.format_line(step=step, max_steps=max_steps),
+                    **task_budget.snapshot(),
+                }
+            )
 
             tool_calls = assistant_dict.get("tool_calls") or []
             if not tool_calls:
@@ -550,6 +663,7 @@ def run_agent(
                 raw_args = tc["function"]["arguments"]
                 call_id = tc["id"]
                 args_summary = _summarize_args(raw_args)
+                task_budget.record_tool(name)
                 log(f"[tool] {name}({args_summary})")
                 emit(
                     {
@@ -565,6 +679,7 @@ def run_agent(
                 parsed = _parse_args(raw_args)
                 fp_args: dict[str, Any] | str = parsed if isinstance(parsed, dict) else raw_args
                 streak, fp = loop_guard.observe(name, fp_args)
+                cycle_hit = loop_guard.cycle_status()
                 if streak >= loop_guard.warn_after:
                     log(f"[loop_guard] streak={streak} tool={name}")
                     emit(
@@ -575,6 +690,22 @@ def run_agent(
                             "streak": streak,
                             "fingerprint": fp[:200],
                             "will_stop": streak >= loop_guard.stop_after,
+                        }
+                    )
+                if cycle_hit is not None:
+                    log(
+                        f"[loop_guard] cycle level={cycle_hit.level} "
+                        f"period={cycle_hit.period} repeats={cycle_hit.repeats}"
+                    )
+                    emit(
+                        {
+                            "type": "cycle_warning",
+                            "step": step,
+                            "name": name,
+                            "level": cycle_hit.level,
+                            "period": cycle_hit.period,
+                            "repeats": cycle_hit.repeats,
+                            "will_stop": cycle_hit.level == "stop",
                         }
                     )
 
@@ -596,8 +727,24 @@ def run_agent(
                         rel_path = str(parsed.get("path") or "")
 
                 reused = False
+                hard_blocked = False
                 cached = loop_guard.same_step_lookup(fp)
-                if cached is not None:
+                if retry_policy.is_blocked(fp):
+                    # Dec-A D3: exhausted strategy → hard BLOCK at dispatch (no handler)
+                    result = retry_policy.blocked_tool_message(name)
+                    hard_blocked = True
+                    log(f"[retry_policy] BLOCKED fingerprint tool={name}")
+                    emit(
+                        {
+                            "type": "strategy_blocked",
+                            "step": step,
+                            "id": call_id,
+                            "name": name,
+                            "fingerprint": fp[:200],
+                            "block_hits": retry_policy.block_hits,
+                        }
+                    )
+                elif cached is not None:
                     result = LoopGuard.dedup_reuse_message(name, cached)
                     reused = True
                     log(f"[dedup] reusing same-step result for {name}")
@@ -664,6 +811,7 @@ def run_agent(
                     name == "load_skill"
                     and isinstance(parsed, dict)
                     and not str(result).startswith("Error")
+                    and not hard_blocked
                 ):
                     loaded_name = str(parsed.get("name") or "").strip()
                     if loaded_name and loaded_name != preloaded_skill:
@@ -685,7 +833,7 @@ def run_agent(
                         ok = False
 
                 err_streak = loop_guard.record_outcome(fp, ok=ok)
-                if err_streak >= loop_guard.error_nudge_after:
+                if err_streak >= loop_guard.error_nudge_after and not hard_blocked:
                     log(f"[loop_guard] error_streak={err_streak} tool={name}")
                     emit(
                         {
@@ -697,19 +845,43 @@ def run_agent(
                         }
                     )
 
-                if not ok:
+                obs_streak = 0
+                if not reused and not hard_blocked:
+                    obs_streak = loop_guard.record_observation(name, str(body_for_ok))
+                    if obs_streak >= loop_guard.stagnation_warn_after:
+                        log(f"[loop_guard] obs_streak={obs_streak} tool={name}")
+                        emit(
+                            {
+                                "type": "stagnation_warning",
+                                "step": step,
+                                "name": name,
+                                "obs_streak": obs_streak,
+                                "will_stop": (
+                                    loop_guard.stagnation_stop_after > 0
+                                    and obs_streak >= loop_guard.stagnation_stop_after
+                                ),
+                            }
+                        )
+
+                if hard_blocked:
+                    # Already banned; do not re-record. Stop after tool message is written.
+                    step_had_failure = True
+                elif not ok:
                     step_had_failure = True
                     retry_decision = retry_policy.record_failure(
                         tool_name=name,
                         args=parsed if isinstance(parsed, dict) else None,
                         result=str(body_for_ok),
                     )
+                    if retry_decision.should_stop:
+                        retry_policy.ban_fingerprint(fp)
                     if ctx is not None:
                         ctx._sync_task_retry_fields()
                     log(
                         f"[retry_policy] key={retry_decision.key} "
                         f"stage={retry_decision.stage}/{retry_policy.max_failures} "
                         f"count={retry_decision.count}"
+                        f"{' BAN' if retry_decision.should_stop else ''}"
                     )
                     emit(
                         {
@@ -720,7 +892,8 @@ def run_agent(
                             "stage": retry_decision.stage,
                             "count": retry_decision.count,
                             "max_failures": retry_policy.max_failures,
-                            "will_stop": retry_decision.should_stop,
+                            "will_stop": False,
+                            "banned": retry_decision.should_stop,
                             "failed_strategies": [
                                 s.to_dict() for s in list(retry_policy.by_key.values())[:8]
                             ],
@@ -728,66 +901,13 @@ def run_agent(
                     )
                     if retry_decision.suffix:
                         stored = f"{stored}{retry_decision.suffix}"
-                    if retry_decision.should_stop:
-                        result_summary = _summarize_result(stored)
-                        log(f"[result] {result_summary}")
-                        emit(
-                            {
-                                "type": "tool_result",
-                                "step": step,
-                                "id": call_id,
-                                "name": name,
-                                "ok": False,
-                                "result": stored if len(stored) <= 4000 else stored[:4000] + "\n...[truncated]",
-                                "result_summary": result_summary,
-                                "compressed": (not reused) and stored != result,
-                                "dedup": reused,
-                            }
-                        )
-                        if ctx is not None:
-                            emit(
-                                {
-                                    "type": "task_state",
-                                    "step": step,
-                                    "task_state": ctx.task_state.to_dict(),
-                                    "retry_stage": ctx.task_state.retry_stage,
-                                    "failed_strategies": ctx.task_state.failed[:8],
-                                }
-                            )
-                        messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": call_id,
-                                "content": stored,
-                            }
-                        )
-                        final = (
-                            f"(stopped: strategy `{retry_decision.key}` failed "
-                            f"{retry_decision.count} times — retry_exhausted)"
-                        )
-                        log(f"[agent] {final}")
-                        emit(
-                            {
-                                "type": "final",
-                                "step": step,
-                                "text": final,
-                                "stopped_reason": "retry_exhausted",
-                            }
-                        )
-                        emit({"type": "step_end", "step": step, "kind": "retry_exhausted"})
-                        return _finish(
-                            AgentResult(
-                                final_text=final,
-                                steps=step,
-                                stopped_reason="retry_exhausted",
-                                messages=messages,
-                                memory=ctx.export_memory() if ctx is not None else None,
-                            )
-                        )
+                    # Dec-A: exhausted → ban fingerprint; hard stop waits for next
+                    # same-fp dispatch (BLOCK). Model may switch strategy on this turn.
 
                 # After tests-passed nudge only: mutating tools may escalate to force-stop
                 if (
-                    ctx is not None
+                    not hard_blocked
+                    and ctx is not None
                     and ctx.task_state.final_nudge_sent
                     and reasons_allow_force_stop(ctx.task_state.stop_nudge_reasons)
                     and is_mutating_tool(name)
@@ -860,8 +980,21 @@ def run_agent(
                 if warn:
                     stored = f"{stored}{warn}"
                 nudge = loop_guard.error_nudge_suffix(name, err_streak)
-                if nudge and (not warn or "STOP" not in warn):
+                if nudge and (not warn or "STOP" not in warn) and not hard_blocked:
                     stored = f"{stored}{nudge}"
+                cycle_sfx = loop_guard.cycle_suffix(cycle_hit)
+                if cycle_sfx and not hard_blocked:
+                    # Prefer CYCLE_STOP over CYCLE_WARN text; skip if exact STOP already
+                    if cycle_hit and cycle_hit.level == "stop":
+                        stored = f"{stored}{cycle_sfx}"
+                    elif not warn or "STOP" not in warn:
+                        stored = f"{stored}{cycle_sfx}"
+                stag_sfx = loop_guard.stagnation_suffix(name, obs_streak)
+                if stag_sfx and not hard_blocked:
+                    if "STAGNATION_STOP" in stag_sfx or (
+                        not warn or "STOP" not in warn
+                    ):
+                        stored = f"{stored}{stag_sfx}"
 
                 result_summary = _summarize_result(stored)
                 log(f"[result] {result_summary}")
@@ -930,6 +1063,31 @@ def run_agent(
                     }
                 )
 
+                if hard_blocked:
+                    final = (
+                        f"(stopped: blocked exhausted strategy for `{name}` "
+                        f"— retry_exhausted)"
+                    )
+                    log(f"[agent] {final}")
+                    emit(
+                        {
+                            "type": "final",
+                            "step": step,
+                            "text": final,
+                            "stopped_reason": "retry_exhausted",
+                        }
+                    )
+                    emit({"type": "step_end", "step": step, "kind": "retry_exhausted"})
+                    return _finish(
+                        AgentResult(
+                            final_text=final,
+                            steps=step,
+                            stopped_reason="retry_exhausted",
+                            messages=messages,
+                            memory=ctx.export_memory() if ctx is not None else None,
+                        )
+                    )
+
                 if streak >= loop_guard.stop_after:
                     final = (
                         f"(stopped: identical tool `{name}` repeated {streak} times "
@@ -950,6 +1108,59 @@ def run_agent(
                             final_text=final,
                             steps=step,
                             stopped_reason="loop_detected",
+                            messages=messages,
+                            memory=ctx.export_memory() if ctx is not None else None,
+                        )
+                    )
+
+                if cycle_hit is not None and cycle_hit.level == "stop":
+                    final = (
+                        f"(stopped: alternating tool pattern period={cycle_hit.period} "
+                        f"repeats={cycle_hit.repeats} — cycle_detected)"
+                    )
+                    log(f"[agent] {final}")
+                    emit(
+                        {
+                            "type": "final",
+                            "step": step,
+                            "text": final,
+                            "stopped_reason": "cycle_detected",
+                        }
+                    )
+                    emit({"type": "step_end", "step": step, "kind": "cycle_detected"})
+                    return _finish(
+                        AgentResult(
+                            final_text=final,
+                            steps=step,
+                            stopped_reason="cycle_detected",
+                            messages=messages,
+                            memory=ctx.export_memory() if ctx is not None else None,
+                        )
+                    )
+
+                if (
+                    loop_guard.stagnation_stop_after > 0
+                    and obs_streak >= loop_guard.stagnation_stop_after
+                ):
+                    final = (
+                        f"(stopped: same observation {obs_streak} times "
+                        f"for `{name}` — stagnation_detected)"
+                    )
+                    log(f"[agent] {final}")
+                    emit(
+                        {
+                            "type": "final",
+                            "step": step,
+                            "text": final,
+                            "stopped_reason": "stagnation_detected",
+                        }
+                    )
+                    emit({"type": "step_end", "step": step, "kind": "stagnation_detected"})
+                    return _finish(
+                        AgentResult(
+                            final_text=final,
+                            steps=step,
+                            stopped_reason="stagnation_detected",
                             messages=messages,
                             memory=ctx.export_memory() if ctx is not None else None,
                         )

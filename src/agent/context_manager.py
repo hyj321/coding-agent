@@ -104,6 +104,8 @@ class ContextState:
     layout_mode: str = "prefix_stable_suffix_variable"
     last_failed_tool: str | None = None
     last_failed_preview: str = ""
+    # Cost-B: injected each step from TaskBudget.format_line(...)
+    budget_line: str = ""
 
     def note_path(self, path: str | None) -> None:
         if not path:
@@ -129,6 +131,8 @@ class ContextState:
 
     def render_current_state(self) -> str:
         lines = ["## Current State"]
+        if self.budget_line:
+            lines.append(self.budget_line)
         if self.focus_files:
             lines.append("Focus files (prefer these; re-read only if needed):")
             for f in self.focus_files:
@@ -148,7 +152,14 @@ class ContextState:
             mem = format_memory_section(self.project_memory)
             if mem:
                 lines.append(mem)
-        if len(lines) == 1:
+        has_body = bool(
+            self.focus_files
+            or self.related_files
+            or self.last_errors
+            or self.todos_text
+            or self.project_memory
+        )
+        if not has_body and not self.budget_line:
             lines.append("(no mutable state yet)")
         return "\n".join(lines)
 
@@ -265,32 +276,50 @@ You solve programming tasks by calling tools.
 1. Working directory: {self.workdir}
 2. Paths are relative to that directory unless stated otherwise.
 3. Available tools: {tools_line}
-4. Prefer grep / glob / read_file (with offset/limit for long files) before editing.
-   Avoid blindly list_dir + reading whole files when locating symbols or errors.
-5. Prefer edit_file for small edits; write_file for create/rewrite.
-6. Use run_shell for tests/scripts (non-interactive).
-7. Plan-then-Act (coarse): for non-trivial multi-step tasks, call todo_write with
+4. Prefer edit_file for small edits; write_file for create/rewrite.
+5. Prefer run_tests (target=*_test.py) over run_shell when verifying tests —
+   it returns structured exit_code/passed for Completion evidence. Use run_shell
+   for other non-interactive commands. Use git_status / git_diff (read-only) to
+   inspect changes — do not use shell for plain git status/diff.
+6. Plan-then-Act (coarse): for non-trivial multi-step tasks, call todo_write with
    3–5 phase-level items (e.g. locate → fix → verify)—NOT one todo per file or
    per tool call. Keep at most one item in_progress. Update todo_write only at
    phase boundaries (complete a phase, change plan, or finish)—not after every tool.
    Trivial one-shot edits (single obvious file, no investigation) may skip todo_write.
-8. Batch tools in ONE assistant turn whenever independent: e.g. todo_write +
+7. Batch tools in ONE assistant turn whenever independent: e.g. todo_write +
    grep/glob/read_file together; multiple read_file/glob/grep calls together; load_skill
    with the first reads. Never waste a turn on todo_write alone when you already
    know what to read or edit next. Dependent calls stay sequential across turns
    (e.g. run_shell then edit based on its output).
-9. When done, give a clear final answer and stop calling tools.
-10. Reply to the user in Simplified Chinese (简体中文) for FINAL answers,
+8. When done, give a clear final answer and stop calling tools.
+9. Reply to the user in Simplified Chinese (简体中文) for FINAL answers,
     summaries, and explanations unless they explicitly ask for another language.
     Keep tool names, paths, and code in their original form.
-11. On tool errors, adjust approach briefly and retry—do not repeat the exact
-    same tool+arguments unchanged.
-12. Project Memory (MEMORY.md) may appear under Current State — treat it as
+10. On tool errors, adjust approach briefly and retry—do not repeat the exact
+    same tool+arguments unchanged. Fingerprints listed as Failed / BLOCKED are
+    hard-blocked at dispatch — change args or tool.
+11. Project Memory (MEMORY.md) may appear under Current State — treat it as
     durable cross-run notes (conventions / past pitfalls); do not ignore it.
-13. Use memory_search for keyword recall; rag_search for local TF–IDF semantic recall.
-14. Prompt layout: system+task are a stable prefix; working memory is a variable suffix.
-15. If an Available Skill matches the task, call load_skill(name) early (same turn
+12. Use memory_search for keyword recall; rag_search for local TF–IDF semantic recall.
+13. Prompt layout: system+task are a stable prefix; working memory is a variable suffix.
+14. If an Available Skill matches the task, call load_skill(name) early (same turn
     as first reads when possible), then follow it.
+
+## Decision discipline (goal–state)
+D1. Before each tool call, read Current State: goal, evidence (tests/diff/todos),
+    and Failed strategies — decide from that state, not from memory of prior turns alone.
+D2. Never repeat a tool+args fingerprint that is Failed/BLOCKED; change arguments,
+    switch tools, or ask the user.
+D3. Do not claim the task is done without verification evidence (prefer run_tests
+    green / agreed acceptance). Empty claims will be rejected by CompletionGate.
+
+## Search-first (locate before bulk read)
+A. To find symbols, error strings, or failing assertions: call grep and/or glob
+   BEFORE whole-tree list_dir or full-file reads.
+B. After a grep hit: read_file with offset/limit around that line — do not re-read
+   the entire file. Long files without offset return only an auto-head window.
+C. Blind list_dir of the whole repo + full-file read without a search target is an
+   anti-pattern; use list_dir only when you need directory structure, not content.
 {skills_section}
 ## Progressive Disclosure
 - Do NOT paste entire files into your reasoning.

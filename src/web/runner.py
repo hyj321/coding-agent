@@ -302,6 +302,7 @@ def run_coding_task(
         transcript_dir=config.transcript_dir,
         cancel_event=cancel_event,
         steer_inbox=steer_inbox,
+        max_task_tokens=getattr(config, "max_task_tokens", 0) or 0,
     )
 
     transcript_path: Path | None = None

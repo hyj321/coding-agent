@@ -108,6 +108,35 @@ class TaskState:
             parsed = parse_test_status(cmd, result)
             if parsed is not None:
                 self.test_status = parsed
+        elif tool_name == "run_tests":
+            target = "."
+            if isinstance(args, dict):
+                raw = args.get("target")
+                if isinstance(raw, str) and raw.strip():
+                    target = raw.strip()
+            # Label must look like a test command for the parser heuristic
+            parsed = parse_test_status(f"run_tests {target}", result)
+            if parsed is not None:
+                self.test_status = parsed
+            else:
+                # Still record exit from our structured header
+                exit_m = _EXIT_CODE.search(result or "")
+                code = int(exit_m.group(1)) if exit_m else None
+                passed_line = re.search(r"(?m)^passed:\s*(true|false)\s*$", result or "", re.I)
+                all_passed = None
+                if passed_line:
+                    all_passed = passed_line.group(1).lower() == "true"
+                elif code is not None:
+                    all_passed = code == 0
+                if all_passed is not None or code is not None:
+                    self.test_status = TestStatus(
+                        last_command=f"run_tests {target}"[:200],
+                        passed=all_passed,
+                        summary=(
+                            f"exit={code}" if code is not None else f"passed={all_passed}"
+                        ),
+                        fingerprint=f"test:pass={all_passed}:e={code}",
+                    )
 
     def render_block(self) -> str:
         lines = ["### Task State"]
@@ -206,7 +235,14 @@ def parse_test_status(command: str, output: str) -> TestStatus | None:
     cmd_l = (command or "").lower()
     looks_like_test = any(
         token in cmd_l
-        for token in ("pytest", "py.test", "unittest", "nosetests", "greeter_test")
+        for token in (
+            "pytest",
+            "py.test",
+            "unittest",
+            "nosetests",
+            "greeter_test",
+            "run_tests",
+        )
     )
     if not looks_like_test and "test" not in cmd_l:
         return None

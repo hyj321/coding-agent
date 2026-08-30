@@ -1,0 +1,3 @@
+# Capability eval outputs (live baselines). Offline mode does not require this dir.
+*.json
+!.gitkeep

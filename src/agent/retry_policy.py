@@ -59,6 +59,13 @@ def make_failure_key(
                 path = "unittest"
             elif cmd:
                 path = "shell:" + re.sub(r"\s+", " ", cmd)[:60]
+        elif tool_name == "run_tests":
+            raw_t = args.get("target")
+            path = (
+                str(raw_t).replace("\\", "/").strip()[:120]
+                if isinstance(raw_t, str) and raw_t.strip()
+                else "run_tests"
+            )
     err = extract_error_class(result)
     return f"{tool_name}|{path}|{err}"
 
@@ -109,12 +116,20 @@ class RetryDecision:
 
 @dataclass
 class RetryPolicy:
-    """Track per-strategy failure counts; stage 3 (default) stops the run."""
+    """Track per-strategy failure counts; exhausted strategies hard-BLOCK at dispatch.
+
+    After ``max_failures`` for a failure_key, the tool-call fingerprint is banned.
+    The run does **not** stop on that failure alone — the model may switch strategy.
+    A later call with the same fingerprint is blocked (no handler) and should stop
+    the run with ``retry_exhausted`` (see agent loop).
+    """
 
     max_failures: int = 3
     by_key: dict[str, FailedStrategy] = field(default_factory=dict)
     last_key: str | None = None
     last_stage: int = 0
+    blocked_fingerprints: set[str] = field(default_factory=set)
+    block_hits: int = 0
 
     @classmethod
     def from_env(cls, *, max_failures: int | None = None) -> RetryPolicy:
@@ -126,6 +141,23 @@ class RetryPolicy:
         if n < 2:
             raise ValueError("RETRY_MAX_FAILURES must be >= 2")
         return cls(max_failures=n)
+
+    def is_blocked(self, fingerprint: str) -> bool:
+        return bool(fingerprint) and fingerprint in self.blocked_fingerprints
+
+    def ban_fingerprint(self, fingerprint: str) -> None:
+        if fingerprint:
+            self.blocked_fingerprints.add(fingerprint)
+
+    def blocked_tool_message(self, name: str) -> str:
+        """Dispatch-boundary hard block (Strands-style cancel_tool). Must start with Error:."""
+        banned = self.banned_strategies_text()
+        self.block_hits += 1
+        return (
+            f"Error: BLOCKED: strategy exhausted for tool `{name}`; "
+            f"change args or tool. Do not retry the same call.\n"
+            f"Banned strategies:\n{banned}"
+        )
 
     def record_failure(
         self,
@@ -163,6 +195,8 @@ class RetryPolicy:
         self.last_key = key
         self.last_stage = stage
         should_stop = existing.count >= self.max_failures
+        # should_stop means: ban fingerprint + soft STOP suffix; hard stop is on
+        # the next same-fingerprint dispatch (BLOCK), not on this failure alone.
         return RetryDecision(
             key=key,
             stage=stage,
@@ -178,8 +212,9 @@ class RetryPolicy:
             return (
                 f"\n\n[retry_policy] STOP stage={strat.stage}/{self.max_failures}: "
                 f"strategy `{strat.key}` failed {strat.count} times. "
-                f"Do not retry the same approach. Ask the user or give a final "
-                f"status report.\nBanned strategies:\n{banned}"
+                f"This fingerprint is now BLOCKED at dispatch — you MUST change "
+                f"args or tool (do not retry the same call). Ask the user or give "
+                f"a final status report if stuck.\nBanned strategies:\n{banned}"
             )
         if strat.stage >= 2:
             return (
@@ -223,6 +258,8 @@ class RetryPolicy:
             "last_key": self.last_key,
             "last_stage": self.last_stage,
             "failed": [s.to_dict() for s in self.by_key.values()],
+            "blocked_fingerprints": sorted(self.blocked_fingerprints)[:40],
+            "block_hits": self.block_hits,
         }
 
     @classmethod
@@ -239,4 +276,12 @@ class RetryPolicy:
                 if isinstance(item, dict) and item.get("key"):
                     fs = FailedStrategy.from_dict(item)
                     policy.by_key[fs.key] = fs
+                    # Re-ban fingerprints for exhausted strategies if caller also
+                    # persisted blocked_fingerprints; otherwise keys alone are soft.
+        blocked = data.get("blocked_fingerprints")
+        if isinstance(blocked, list):
+            for fp in blocked[:40]:
+                if isinstance(fp, str) and fp.strip():
+                    policy.blocked_fingerprints.add(fp.strip())
+        policy.block_hits = int(data.get("block_hits") or 0)
         return policy

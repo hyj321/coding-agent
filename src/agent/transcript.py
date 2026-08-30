@@ -72,10 +72,14 @@ def save_transcript(
         }
         turns = list(existing.get("turns") or [])
         turn_usage = None
+        turn_cost = None
         if isinstance(result.memory, dict):
             cu = result.memory.get("context_usage")
             if isinstance(cu, dict):
                 turn_usage = cu
+            cr = result.memory.get("cost_report")
+            if isinstance(cr, dict):
+                turn_cost = cr
         turns.append(
             {
                 "created_at": stamp,
@@ -87,6 +91,7 @@ def save_transcript(
                 if isinstance(result.memory, dict)
                 else None,
                 "context_usage": turn_usage,
+                "cost_report": turn_cost,
             }
         )
         title = str(existing.get("task") or task)
@@ -128,16 +133,21 @@ def save_transcript(
             "file_changes": existing.get("file_changes") or [],
             "memory": result.memory,
             "context_usage": turn_usage,
+            "cost_report": turn_cost,
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return path
 
     path = directory / f"run_{stamp}.json"
     turn_usage = None
+    turn_cost = None
     if isinstance(result.memory, dict):
         cu = result.memory.get("context_usage")
         if isinstance(cu, dict):
             turn_usage = cu
+        cr = result.memory.get("cost_report")
+        if isinstance(cr, dict):
+            turn_cost = cr
     payload = {
         "created_at": stamp,
         "task": task,
@@ -148,6 +158,7 @@ def save_transcript(
         "messages": result.messages,
         "memory": result.memory,
         "context_usage": turn_usage,
+        "cost_report": turn_cost,
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path

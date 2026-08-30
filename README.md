@@ -17,7 +17,7 @@
 ## 功能一览
 
 - Agent 主循环 + `max_steps` / 用户中断
-- 工具：`read_file`（支持 `offset`/`limit` 切片）/ `write_file` / `edit_file` / `list_dir` / `glob` / `grep` / `run_shell` / `todo_write` / `load_skill` / `memory_search` / `rag_search`
+- 工具：`read_file`（`offset`/`limit`；≥100 行 auto-head）/ `write_file` / `edit_file`（`.py` ast 护栏）/ `list_dir` / `glob` / `grep` / `run_shell` / **`run_tests`** / **`git_status`** / **`git_diff`** / `todo_write` / `load_skill` / `memory_search` / `rag_search`
 - Skills：渐进披露（目录常驻 + `load_skill` / 关键词预注入），见 `skills/{debugging,testing,refactoring}/`
 - 路径沙箱 + `--approval auto|ask|never`
 - **三级风险元数据**（`risk_level` / `is_readonly`）：Low 自动放行；Medium/High 受 approval 约束；`.env` / SSH Key 等敏感路径 **始终 Deny**
@@ -97,7 +97,39 @@ Agent Loop (src/agent/loop.py)
 2. **新工具 = 注册表加一项**，主循环不必改。
 3. **Todo 是一等工具**，不是另起一套框架；规划与执行仍在同一 loop 里。
 4. **安全在工具边界执行**：`PermissionGate` 读 Registry 元数据 + 参数启发式（敏感路径 / 危险 shell），不依赖模型「保证遵守」。
-5. **完成靠证据**：Harness 用 pytest / exit code 决定能否 Terminate；模型自述「已修好」不够。
+5. **完成靠证据**：Harness 用测试 exit code / `run_tests` 决定能否 Terminate；模型自述「已修好」不够。
+
+## Capability 边界（会做什么 / 不做什么）
+
+**会做：** 工作区内读写改文件、内容/文件名搜索、跑测试与 shell、只读 git status/diff、Todo/Skill/轻量记忆。
+
+**不做（刻意）：** 浏览器 / 外网检索、MCP、LSP 跳转、多子 Agent 并行、OS 级沙箱（仅路径沙箱）、自动 `git commit/push`。
+
+更多质量标准与改造序见 [`Agent质量标准与改进路线.md`](./Agent质量标准与改进路线.md)。
+
+## Capability Eval（Cap-C）
+
+```powershell
+# 离线（无 API）：指标打分 + 种 bug / run_tests 路径
+python -m scripts.run_capability_eval --offline
+
+# 在线（需 DEEPSEEK_API_KEY）：locate-string + fix-greeter，输出 steps 表
+python -m scripts.run_capability_eval --live
+# 只跑一个任务：
+python -m scripts.run_capability_eval --live --task fix-greeter
+```
+
+Live 结果默认写入 `evals/results/live_*.json`，把表里的 `steps` 记进质量文档 §13 作基线。
+
+## Cost Eval（Cost-C）
+
+```powershell
+python -m scripts.run_cost_eval --offline
+python -m scripts.run_cost_eval --live
+python -m scripts.run_cost_eval --live --low-budget 8000
+```
+
+Live 结果写入 `evals/results/cost_live_*.json`（`tokens_total_est` / 低压 `budget_exhausted` 基线见质量文档 §13）。
 
 ## 环境变量 / CLI
 
@@ -112,6 +144,8 @@ Agent Loop (src/agent/loop.py)
 | `DENY_HIGH` | `true` 时 High 在 auto 下也拒绝（Web 默认开启） |
 | `--max-steps` / `--max-messages` | 循环与上下文上限 |
 | `--context-budget` / `CONTEXT_TOKEN_BUDGET` | Context Manager 近似 token 预算（默认 **32000**） |
+| `--max-task-tokens` / `MAX_TASK_TOKENS` | 任务累计 token 硬闸（默认 **0=关闭**；触顶 `budget_exhausted`） |
+| `TASK_BUDGET_WARN_RATIO` | 剩余 ≤ 该比例时注入一次性 `[budget_warn]`（默认 **0.20**） |
 | `--transcript-dir` | 默认 `transcripts`；`off` 关闭 |
 
 进度与计划见 `计划书.md`。

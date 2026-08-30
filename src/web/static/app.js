@@ -82,7 +82,7 @@ const CONTEXT_RING_LEN = 87.96;
 let contextRingOpen = false;
 let lastContextUsage = null;
 
-/** Per-turn cost panel (steps + rough context tokens). */
+/** Per-turn cost panel (steps + rough tokens + tool attribution). */
 let turnCost = {
   step: 0,
   maxSteps: 0,
@@ -90,6 +90,10 @@ let turnCost = {
   budgetTokens: null,
   peakTokens: 0,
   level: "ok",
+  taskTokens: null,
+  maxTaskTokens: null,
+  toolCounts: null,
+  costSummary: null,
 };
 
 function formatTok(n) {
@@ -99,6 +103,16 @@ function formatTok(n) {
   return String(Math.round(v));
 }
 
+function formatToolCounts(counts) {
+  if (!counts || typeof counts !== "object") return "";
+  const entries = Object.entries(counts).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  if (!entries.length) return "";
+  return entries
+    .slice(0, 4)
+    .map(([n, c]) => `${n}×${c}`)
+    .join(", ");
+}
+
 function renderCostPanel() {
   if (costSteps) {
     const cur = turnCost.step > 0 ? turnCost.step : "—";
@@ -106,22 +120,36 @@ function renderCostPanel() {
     costSteps.textContent = `${cur} / ${max} 步`;
   }
   if (costTokens) {
-    const used = formatTok(turnCost.usedTokens);
-    const budget = formatTok(turnCost.budgetTokens);
-    if (turnCost.usedTokens == null && turnCost.budgetTokens == null) {
-      costTokens.textContent = "≈ — tok";
-    } else if (turnCost.budgetTokens != null) {
-      costTokens.textContent = `≈ ${used} / ${budget} tok`;
+    if (turnCost.maxTaskTokens != null && turnCost.maxTaskTokens > 0) {
+      const used = formatTok(turnCost.taskTokens ?? turnCost.usedTokens);
+      const budget = formatTok(turnCost.maxTaskTokens);
+      costTokens.textContent = `任务 ≈ ${used} / ${budget} tok`;
+    } else if (turnCost.taskTokens != null) {
+      costTokens.textContent = `任务 ≈ ${formatTok(turnCost.taskTokens)} tok`;
     } else {
-      costTokens.textContent = `≈ ${used} tok`;
+      const used = formatTok(turnCost.usedTokens);
+      const budget = formatTok(turnCost.budgetTokens);
+      if (turnCost.usedTokens == null && turnCost.budgetTokens == null) {
+        costTokens.textContent = "≈ — tok";
+      } else if (turnCost.budgetTokens != null) {
+        costTokens.textContent = `窗 ≈ ${used} / ${budget} tok`;
+      } else {
+        costTokens.textContent = `≈ ${used} tok`;
+      }
     }
   }
   if (costPanel) {
     costPanel.dataset.level = turnCost.level || "ok";
     const peak =
-      turnCost.peakTokens > 0 ? ` · 峰值 ${formatTok(turnCost.peakTokens)}` : "";
+      turnCost.peakTokens > 0 ? ` · 窗峰值 ${formatTok(turnCost.peakTokens)}` : "";
+    const tools = formatToolCounts(turnCost.toolCounts);
+    const toolBit = tools ? ` · 工具 ${tools}` : "";
     costPanel.title =
-      `本轮步数 + 上下文窗口粗估（非 API 账单）${peak}`;
+      (turnCost.maxTaskTokens > 0
+        ? "本轮步数 + 任务累计 token 硬闸粗估（非 API 账单）"
+        : "本轮步数 + token 粗估（任务硬闸关闭时显示上下文窗）") +
+      peak +
+      toolBit;
   }
 }
 
@@ -133,6 +161,10 @@ function resetCostPanel(maxSteps) {
     budgetTokens: null,
     peakTokens: 0,
     level: "ok",
+    taskTokens: null,
+    maxTaskTokens: null,
+    toolCounts: null,
+    costSummary: null,
   };
   renderCostPanel();
 }
@@ -160,8 +192,41 @@ function noteCostUsage(data) {
   renderCostPanel();
 }
 
+function noteTaskBudget(data) {
+  if (!data) return;
+  if (data.tokens_used != null || data.tokens_total_est != null) {
+    const used = Number(data.tokens_used ?? data.tokens_total_est);
+    if (Number.isFinite(used)) turnCost.taskTokens = used;
+  }
+  if (data.max_task_tokens != null) {
+    const cap = Number(data.max_task_tokens);
+    if (Number.isFinite(cap)) turnCost.maxTaskTokens = cap;
+  }
+  if (data.tool_counts && typeof data.tool_counts === "object") {
+    turnCost.toolCounts = data.tool_counts;
+  }
+  if (data.level) turnCost.level = data.level;
+  if (data.peak_context_tokens != null) {
+    const peak = Number(data.peak_context_tokens);
+    if (Number.isFinite(peak) && peak > turnCost.peakTokens) turnCost.peakTokens = peak;
+  }
+  if (data.step != null) noteCostStep(data.step, data.max_steps);
+  else renderCostPanel();
+}
+
+function noteCostReport(data) {
+  if (!data) return;
+  noteTaskBudget(data);
+  if (data.summary) turnCost.costSummary = data.summary;
+  if (data.steps != null) noteCostStep(data.steps, data.max_steps);
+  renderCostPanel();
+}
+
 function costSummaryMeta() {
   const parts = [];
+  if (turnCost.costSummary) {
+    return turnCost.costSummary;
+  }
   if (turnCost.step > 0) {
     parts.push(
       turnCost.maxSteps
@@ -169,11 +234,21 @@ function costSummaryMeta() {
         : `${turnCost.step} 步`
     );
   }
-  if (turnCost.peakTokens > 0) {
-    parts.push(`峰值 ≈ ${formatTok(turnCost.peakTokens)} tok`);
+  if (turnCost.taskTokens != null) {
+    if (turnCost.maxTaskTokens > 0) {
+      parts.push(
+        `任务 ≈ ${formatTok(turnCost.taskTokens)}/${formatTok(turnCost.maxTaskTokens)} tok`
+      );
+    } else {
+      parts.push(`任务 ≈ ${formatTok(turnCost.taskTokens)} tok`);
+    }
+  } else if (turnCost.peakTokens > 0) {
+    parts.push(`窗峰值 ≈ ${formatTok(turnCost.peakTokens)} tok`);
   } else if (turnCost.usedTokens != null) {
     parts.push(`≈ ${formatTok(turnCost.usedTokens)} tok`);
   }
+  const tools = formatToolCounts(turnCost.toolCounts);
+  if (tools) parts.push(`工具 ${tools}`);
   return parts.join(" · ");
 }
 
@@ -477,8 +552,11 @@ function formatStoppedReason(reason) {
     max_steps: "达到最大步数",
     interrupted: "已按你的要求停止",
     loop_detected: "检测到重复操作，已停止",
+    cycle_detected: "检测到交替转圈，已停止",
+    stagnation_detected: "检测到输出停滞，已停止",
     retry_exhausted: "多次失败后已停止",
     goal_met_forced: "测试已通过，已自动结束",
+    budget_exhausted: "任务 token 预算耗尽，已停止",
   };
   return map[reason] || reason || "";
 }
@@ -1209,6 +1287,18 @@ function handleEvent(data) {
     case "context_usage":
       updateContextMeter(data);
       break;
+    case "task_budget":
+      noteTaskBudget(data);
+      break;
+    case "cost_report":
+      noteCostReport(data);
+      break;
+    case "budget_warn":
+      addInfoBubble(data.text || "预算偏低，请收束探索。");
+      break;
+    case "budget_exhausted":
+      noteTaskBudget(data);
+      break;
     case "turn_summary":
       addTurnSummaryBubble(data.text || "");
       if (data.context_usage) updateContextMeter(data.context_usage);
@@ -1220,6 +1310,7 @@ function handleEvent(data) {
       break;
     case "done":
       hideApprovalBar();
+      if (data.cost_report) noteCostReport(data.cost_report);
       if (data.steps != null) noteCostStep(data.steps, turnCost.maxSteps);
       {
         const costBit = costSummaryMeta();

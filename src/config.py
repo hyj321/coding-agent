@@ -21,6 +21,9 @@ class Config:
     max_tool_output_chars: int = 8000
     max_messages: int = 40
     context_token_budget: int = 32000
+    # Cost-A: cumulative task token hard cap (0 = disabled)
+    max_task_tokens: int = 0
+    task_token_output_reserve: int = 512
     approval: ApprovalMode = ApprovalMode.AUTO
     transcript_dir: Path | None = None
     loop_warn_after: int = 3
@@ -45,6 +48,8 @@ class Config:
         transcript_dir: str | Path | None = None,
         max_messages: int | None = None,
         context_token_budget: int | None = None,
+        max_task_tokens: int | None = None,
+        task_token_output_reserve: int | None = None,
         loop_warn_after: int | None = None,
         loop_stop_after: int | None = None,
         loop_error_nudge_after: int | None = None,
@@ -95,6 +100,21 @@ class Config:
         )
         if token_budget < 1500:
             raise ValueError("CONTEXT_TOKEN_BUDGET must be >= 1500")
+
+        task_tok = (
+            max_task_tokens
+            if max_task_tokens is not None
+            else int(os.getenv("MAX_TASK_TOKENS", "0") or "0")
+        )
+        if task_tok < 0:
+            raise ValueError("MAX_TASK_TOKENS must be >= 0 (0 disables the hard gate)")
+        out_reserve = (
+            task_token_output_reserve
+            if task_token_output_reserve is not None
+            else int(os.getenv("TASK_TOKEN_OUTPUT_RESERVE", "512") or "512")
+        )
+        if out_reserve < 0:
+            raise ValueError("TASK_TOKEN_OUTPUT_RESERVE must be >= 0")
 
         mode = parse_approval_mode(approval or os.getenv("APPROVAL") or "auto")
 
@@ -169,6 +189,8 @@ class Config:
             max_tool_output_chars=max_out,
             max_messages=keep,
             context_token_budget=token_budget,
+            max_task_tokens=task_tok,
+            task_token_output_reserve=out_reserve,
             approval=mode,
             transcript_dir=tdir,
             loop_warn_after=warn,

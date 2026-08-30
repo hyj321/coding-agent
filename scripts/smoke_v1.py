@@ -6,6 +6,7 @@ Run: python -m scripts.smoke_v1
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import threading
 import time
@@ -30,6 +31,8 @@ def main() -> None:
 
         expected = {
             "edit_file",
+            "git_diff",
+            "git_status",
             "glob",
             "grep",
             "list_dir",
@@ -38,6 +41,7 @@ def main() -> None:
             "rag_search",
             "read_file",
             "run_shell",
+            "run_tests",
             "todo_write",
             "write_file",
         }
@@ -46,10 +50,13 @@ def main() -> None:
         skill_body = reg.dispatch("load_skill", {"name": "debugging"})
         assert skill_body.startswith("# Skill: debugging"), skill_body[:80]
         assert "todo_write" in skill_body and "edit_file" in skill_body
+        assert "Search-first" in skill_body and "grep" in skill_body
         assert reg.dispatch("load_skill", {"name": "missing"}).startswith("Error")
         for extra in ("testing", "refactoring"):
             body = reg.dispatch("load_skill", {"name": extra})
             assert body.startswith(f"# Skill: {extra}"), body[:80]
+        testing_body = reg.dispatch("load_skill", {"name": "testing"})
+        assert "Search-first" in testing_body and "glob" in testing_body
 
         from src.agent.context_manager import build_system_prompt
         from src.agent.skills import (
@@ -69,6 +76,8 @@ def main() -> None:
         assert "Batch tools" in prompt or "Batch tools in ONE" in prompt
         assert "phase-level" in prompt or "phase boundaries" in prompt
         assert "Trivial one-shot" in prompt
+        assert "Search-first" in prompt
+        assert "BEFORE whole-tree list_dir" in prompt or "grep and/or glob" in prompt
         assert "Preloaded" in catalog or "preloaded" in catalog.lower()
 
         # Keyword router: bug fix → debugging; 补测 → testing; 重构 → refactoring
@@ -137,6 +146,154 @@ def main() -> None:
         assert "已按你的要求停止" in result.final_text
         assert any(e.get("type") == "final" and e.get("stopped_reason") == "interrupted" for e in events)
 
+        # Cost-A: TaskBudget unit + sync gate before LLM
+        from types import SimpleNamespace
+
+        from src.agent.task_budget import TaskBudget
+
+        tb = TaskBudget(max_task_tokens=1000, output_reserve=100)
+        assert tb.enabled
+        assert not tb.would_exceed(100)
+        assert tb.would_exceed(950)  # 0+950+100 > 1000
+        tb.record_llm_turn(prompt_tokens=400, completion_tokens=50)
+        assert tb.tokens_used == 450
+        assert tb.llm_calls == 1
+        deny = tb.check_before_llm(
+            [{"role": "user", "content": "x" * 2000}]  # ~500 tok + reserve
+        )
+        assert deny is not None and deny["budget_kind"] == "tokens"
+        assert TaskBudget(max_task_tokens=0).check_before_llm(
+            [{"role": "user", "content": "huge " * 5000}]
+        ) is None
+
+        class _BudgetCfg(_FakeCfg):
+            max_task_tokens = 80
+            task_token_output_reserve = 20
+            tool_visibility = "off"
+            completion_mode = "trust_model"
+
+        class _CountingClient:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.config = _BudgetCfg()
+                self.cache_policy = None
+
+            def chat(self, *_a, **_k):
+                self.calls += 1
+                raise AssertionError("LLM must not run when first prompt exceeds budget")
+
+        budget_client = _CountingClient()
+        budget_events: list = []
+        budget_result = _run_agent(
+            client=budget_client,
+            registry=reg,
+            system_prompt="sys",
+            user_task="do a long coding task that needs tools",
+            max_steps=5,
+            gate=gate,
+            on_event=budget_events.append,
+            persist_memory_md=False,
+            max_task_tokens=80,
+        )
+        assert budget_result.stopped_reason == "budget_exhausted"
+        assert budget_client.calls == 0
+        assert budget_result.steps == 0
+        assert budget_result.memory and budget_result.memory.get("task_budget", {}).get(
+            "budget_kind"
+        ) == "tokens"
+        cr0 = budget_result.memory.get("cost_report") or {}
+        assert cr0.get("tokens_total_est") == 0
+        assert "tool_counts" in cr0
+        assert any(e.get("type") == "budget_exhausted" for e in budget_events)
+        assert any(e.get("type") == "cost_report" for e in budget_events)
+        assert any(
+            e.get("type") == "final" and e.get("stopped_reason") == "budget_exhausted"
+            for e in budget_events
+        )
+
+        # Cost-B: Current State budget line + warn + cost_report tools
+        from src.agent.context_manager import ContextState
+
+        st = ContextState(budget_line="Budget: steps 2/10 | tokens≈1k (cap=off) | level=ok")
+        rendered = st.render_current_state()
+        assert "Budget: steps 2/10" in rendered
+        warn_tb = TaskBudget(max_task_tokens=1000, output_reserve=50, warn_ratio=0.2)
+        warn_tb.record_llm_turn(prompt_tokens=700, completion_tokens=100)
+        assert warn_tb.remaining_pct() is not None and warn_tb.remaining_pct() <= 20
+        w1 = warn_tb.maybe_warn_message(step=2, max_steps=10)
+        assert w1 and "[budget_warn]" in w1
+        assert warn_tb.maybe_warn_message(step=3, max_steps=10) is None  # one-shot
+        line = warn_tb.format_line(step=2, max_steps=10)
+        assert "level=warn" in line or "level=critical" in line
+        assert "Budget:" in line
+
+        # Cost-A: accumulate then block second LLM call (no ContextManager → tiny prompts)
+        class _TwoStepClient:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.config = SimpleNamespace(
+                    model="fake",
+                    context_token_budget=8000,
+                    tool_visibility="off",
+                    completion_mode="trust_model",
+                    evidence_nudge_max=0,
+                    loop_warn_after=3,
+                    loop_stop_after=5,
+                    loop_error_nudge_after=2,
+                    retry_max_failures=3,
+                    final_nudge_mutating_limit=2,
+                    max_task_tokens=0,
+                    task_token_output_reserve=30,
+                    workdir=None,
+                    transcript_dir=None,
+                )
+                self.cache_policy = None
+
+            def chat(self, messages, tools=None):
+                self.calls += 1
+                if self.calls == 1:
+                    tc = SimpleNamespace(
+                        id="call_budget_1",
+                        type="function",
+                        function=SimpleNamespace(
+                            name="list_dir",
+                            arguments='{"path": "."}',
+                        ),
+                    )
+                    msg = SimpleNamespace(
+                        role="assistant",
+                        content="looking",
+                        tool_calls=[tc],
+                    )
+                    return SimpleNamespace(choices=[SimpleNamespace(message=msg)], usage=None)
+                raise AssertionError("second LLM call should be blocked by task budget")
+
+        two = _TwoStepClient()
+        two_events: list = []
+        two_result = _run_agent(
+            client=two,
+            registry=reg,
+            system_prompt="sys",
+            user_task="list then stop",
+            max_steps=5,
+            gate=None,
+            on_event=two_events.append,
+            persist_memory_md=False,
+            max_task_tokens=80,
+            context_manager=None,
+            max_messages=20,
+        )
+        assert two.calls == 1, f"expected 1 LLM call, got {two.calls}"
+        assert two_result.stopped_reason == "budget_exhausted"
+        assert two_result.steps == 1
+        assert two_result.memory["task_budget"]["llm_calls"] == 1
+        cr = two_result.memory.get("cost_report") or {}
+        assert cr.get("llm_calls") == 1
+        assert cr.get("tool_counts", {}).get("list_dir") == 1
+        assert cr.get("tokens_total_est", 0) > 0
+        assert "summary" in cr and "list_dir" in cr["summary"]
+        assert any(e.get("type") == "budget_exhausted" for e in two_events)
+        assert any(e.get("type") == "cost_report" and e.get("tool_counts") for e in two_events)
         # Mid-run steer inbox drains into messages
         from src.agent.steer import SteerInbox, format_steer_message, STEER_MARKER
 
@@ -202,7 +359,7 @@ def main() -> None:
         assert nudge and "ERROR_STREAK" in nudge
         assert guard3.record_outcome(fp_e, ok=True) == 0
 
-        # RetryPolicy stage 1 → 2 → 3 stop
+        # RetryPolicy stage 1 → 2 → 3 ban (hard BLOCK on next same fingerprint)
         rp = RetryPolicy(max_failures=3)
         args_fail = {"path": "greeter.py", "old_string": "a", "new_string": "b"}
         err_body = "Error: old_string not found\nAssertionError: boom"
@@ -213,10 +370,91 @@ def main() -> None:
         d2 = rp.record_failure(tool_name="edit_file", args=args_fail, result=err_body)
         assert d2.stage == 2 and not d2.should_stop and "MUST change" in (d2.suffix or "")
         d3 = rp.record_failure(tool_name="edit_file", args=args_fail, result=err_body)
-        assert d3.stage == 3 and d3.should_stop and "STOP" in (d3.suffix or "")
+        assert d3.stage == 3 and d3.should_stop and "BLOCKED" in (d3.suffix or "")
         assert "edit_file|" in rp.banned_strategies_text()
         assert "Banned strategies" in (d3.suffix or "")
+        fp_fail = tool_call_fingerprint("edit_file", args_fail)
+        assert not rp.is_blocked(fp_fail)
+        rp.ban_fingerprint(fp_fail)
+        assert rp.is_blocked(fp_fail)
+        block_msg = rp.blocked_tool_message("edit_file")
+        assert block_msg.startswith("Error: BLOCKED") and "change args" in block_msg
+        assert rp.block_hits == 1
         assert rp.to_dict()["failed"]
+        assert fp_fail in rp.to_dict()["blocked_fingerprints"]
+        rp2 = RetryPolicy.from_dict(rp.to_dict())
+        assert rp2.is_blocked(fp_fail)
+
+        # Cycle detection: A↔B ping-pong (warn at 2 repeats, stop at 3)
+        guard_c = LoopGuard(
+            warn_after=3,
+            stop_after=5,
+            error_nudge_after=2,
+            cycle_warn_repeats=2,
+            cycle_stop_repeats=3,
+            cycle_max_period=4,
+        )
+        seq_ab = [
+            ("read_file", {"path": "a.py"}),
+            ("run_tests", {"target": "t.py"}),
+        ]
+        # 4 calls = A B A B → warn (repeats=2)
+        for i in range(4):
+            name_i, args_i = seq_ab[i % 2]
+            guard_c.observe(name_i, args_i)
+        hit_w = guard_c.cycle_status()
+        assert hit_w is not None and hit_w.level == "warn" and hit_w.period == 2
+        assert hit_w.repeats == 2
+        assert "CYCLE_WARN" in (guard_c.cycle_suffix() or "")
+        # 6 calls = A B A B A B → stop (repeats=3)
+        for i in range(4, 6):
+            name_i, args_i = seq_ab[i % 2]
+            guard_c.observe(name_i, args_i)
+        hit_s = guard_c.cycle_status()
+        assert hit_s is not None and hit_s.level == "stop" and hit_s.repeats == 3
+        assert "CYCLE_STOP" in (guard_c.cycle_suffix() or "")
+        # Exact streak must NOT count as cycle
+        guard_e = LoopGuard(cycle_warn_repeats=2, cycle_stop_repeats=3)
+        for _ in range(6):
+            guard_e.observe("read_file", {"path": "same.py"})
+        assert guard_e.cycle_status() is None
+        assert guard_e.streak == 6
+
+        # Observation stagnation (Dec-B): warn at 3 identical obs; stop disabled by default
+        from src.agent.loop_guard import observation_fingerprint
+
+        assert observation_fingerprint("read_file", "hello  world") == observation_fingerprint(
+            "read_file", "hello world"
+        )
+        assert observation_fingerprint("read_file", "a") != observation_fingerprint(
+            "run_tests", "a"
+        )
+        guard_s = LoopGuard(stagnation_warn_after=3, stagnation_stop_after=0)
+        for i in range(3):
+            n = guard_s.record_observation("read_file", "same body")
+            assert n == i + 1
+        stag = guard_s.stagnation_suffix("read_file")
+        assert stag and "STAGNATION_WARN" in stag and "STAGNATION_STOP" not in stag
+        guard_s2 = LoopGuard(stagnation_warn_after=3, stagnation_stop_after=5)
+        for _ in range(5):
+            guard_s2.record_observation("run_tests", "FAILED exit_code: 1")
+        assert "STAGNATION_STOP" in (guard_s2.stagnation_suffix("run_tests") or "")
+        guard_s3 = LoopGuard(stagnation_warn_after=3, stagnation_stop_after=0)
+        guard_s3.record_observation("read_file", "a")
+        guard_s3.record_observation("read_file", "b")
+        assert guard_s3.obs_streak == 1
+        assert guard_s3.stagnation_suffix("read_file") is None
+
+        # Decision discipline present in system prompt
+        from src.agent.context_manager import ContextManager
+
+        with tempfile.TemporaryDirectory() as td:
+            cm_dec = ContextManager(workdir=Path(td), tool_names=["read_file", "run_tests"])
+            sp = cm_dec.build_system_prompt()
+            assert "Decision discipline" in sp
+            assert "D1." in sp and "D2." in sp and "D3." in sp
+            assert "BLOCKED" in sp
+            assert "Plan-then-Act" in sp or "plan-then-act" in sp.lower() or "todo_write" in sp
 
         # TaskState + pytest parse + stop conditions
         ts = TaskState.from_goal("fix greeter tests")
@@ -354,9 +592,128 @@ def main() -> None:
         bad_re = reg.dispatch("grep", {"pattern": "("})
         assert bad_re.startswith("Error")
 
+        # Cap-A C5: Python syntax guardrail — reject bad edit/write, leave file intact
+        good_py = (root / "sub" / "a.py").read_text(encoding="utf-8")
+        bad_edit = reg.dispatch(
+            "edit_file",
+            {
+                "path": "sub/a.py",
+                "old_string": "x = 1\n",
+                "new_string": "def broken(\n",
+            },
+        )
+        assert bad_edit.startswith("Error: syntax rejected"), bad_edit
+        assert "NOT modified" in bad_edit
+        assert (root / "sub" / "a.py").read_text(encoding="utf-8") == good_py
+
+        bad_write = reg.dispatch(
+            "write_file",
+            {"path": "sub/bad_new.py", "content": "def nope(\n"},
+        )
+        assert bad_write.startswith("Error: syntax rejected"), bad_write
+        assert not (root / "sub" / "bad_new.py").exists()
+
+        ok_write = reg.dispatch(
+            "write_file",
+            {"path": "sub/ok_new.py", "content": "y = 2\n"},
+        )
+        assert "ok_new.py" in ok_write
+        assert (root / "sub" / "ok_new.py").read_text(encoding="utf-8") == "y = 2\n"
+
+        # Cap-A C6: long file without offset → auto-head (not full body)
+        big_lines = [f"row{i}\n" for i in range(1, 121)]
+        (root / "big.py").write_text("".join(big_lines), encoding="utf-8")
+        auto_head = reg.dispatch("read_file", {"path": "big.py"})
+        assert "auto-head" in auto_head
+        assert "lines 1-100 of 120" in auto_head
+        assert "row1" in auto_head and "row100" in auto_head
+        assert "row101" not in auto_head
+        assert "offset=101" in auto_head
+        continued = reg.dispatch(
+            "read_file", {"path": "big.py", "offset": 101, "limit": 20}
+        )
+        assert "row101" in continued and "row120" in continued
+
         shell = reg.dispatch("run_shell", {"command": "python -c \"print('ok')\""})
         assert "exit_code: 0" in shell
         assert "ok" in shell
+
+        # Cap-B C3: run_tests structured summary + TaskState
+        (root / "mini_test.py").write_text(
+            "def test_ok():\n    assert 1 + 1 == 2\n\n"
+            "if __name__ == '__main__':\n"
+            "    test_ok()\n"
+            "    print('ok')\n",
+            encoding="utf-8",
+        )
+        rt = reg.dispatch(
+            "run_tests", {"target": "mini_test.py", "runner": "python"}
+        )
+        assert "# run_tests" in rt and "passed: true" in rt and "exit_code: 0" in rt
+        from src.agent.task_state import TaskState as _TS
+
+        ts_rt = _TS(goal="smoke")
+        ts_rt.update_from_tool(
+            tool_name="run_tests",
+            args={"target": "mini_test.py", "runner": "python"},
+            result=rt,
+        )
+        assert ts_rt.test_status is not None
+        assert ts_rt.test_status.passed is True
+
+        (root / "mini_fail_test.py").write_text(
+            "def test_bad():\n    assert False\n\n"
+            "if __name__ == '__main__':\n"
+            "    test_bad()\n",
+            encoding="utf-8",
+        )
+        rt_fail = reg.dispatch(
+            "run_tests", {"target": "mini_fail_test.py", "runner": "python"}
+        )
+        assert "passed: false" in rt_fail
+        assert re.search(r"(?m)^exit_code:\s*[1-9]", rt_fail)
+
+        missing_t = reg.dispatch("run_tests", {"target": "no_such_test.py"})
+        assert missing_t.startswith("Error")
+
+        # Cap-B C2: git_status / git_diff (workdir may not be a git repo)
+        gs = reg.dispatch("git_status", {})
+        assert isinstance(gs, str) and len(gs) > 0
+        # Either clean status or explicit not-a-repo error — both OK for smoke
+        assert (
+            gs.startswith("Error: workdir is not a git repository")
+            or gs.startswith("Error: git executable not found")
+            or not gs.startswith("Error:")
+        )
+        gd = reg.dispatch("git_diff", {})
+        assert isinstance(gd, str)
+        assert reg.get("run_tests").risk_level == "medium"
+        assert reg.get("git_status").is_readonly is True
+        assert reg.get("git_diff").risk_level == "low"
+
+        # Cap-C: offline capability eval (metrics + plant-bug/run_tests path)
+        from scripts.run_capability_eval import run_offline
+
+        cap_rows = run_offline()
+        assert cap_rows and all(r.success for r in cap_rows), cap_rows
+
+        # Dec-C: offline decision eval (cycle / BLOCK / stagnation / no-false-cycle)
+        from scripts.run_decision_eval import run_offline as run_decision_offline
+
+        dec_rows = run_decision_offline()
+        assert dec_rows and all(r.success for r in dec_rows), dec_rows
+        assert any(r.case_id == "decision:cycle-stop" and r.pathology_early_stop for r in dec_rows)
+        assert any(r.case_id == "decision:block" and r.blocked_replays >= 1 for r in dec_rows)
+
+        # Cost-C: offline cost eval (budget stop / warn / no-false-kill)
+        from scripts.run_cost_eval import run_offline as run_cost_offline
+
+        cost_rows = run_cost_offline()
+        assert cost_rows and all(r.success for r in cost_rows), cost_rows
+        assert any(r.case_id == "cost:budget-stop-first" and r.budget_stop_early for r in cost_rows)
+        assert any(
+            r.case_id == "cost:gate-off-no-false-kill" and not r.false_budget_kill for r in cost_rows
+        )
 
         # Windows GBK crash regression: UTF-8 bytes that are illegal as GBK
         from src.tools.shell import _decode_output
@@ -550,9 +907,12 @@ def main() -> None:
         explore_names = visible_tool_names(reg, "explore")
         assert "read_file" in explore_names and "write_file" not in explore_names
         assert "grep" in explore_names and "glob" in explore_names
-        assert "run_shell" not in explore_names
+        assert "git_status" in explore_names and "git_diff" in explore_names
+        assert "run_shell" not in explore_names and "run_tests" not in explore_names
         verify_names = visible_tool_names(reg, "verify")
         assert "run_shell" in verify_names and "edit_file" in verify_names
+        assert "run_tests" in verify_names
+        assert "git_status" in verify_names and "git_diff" in verify_names
         assert "write_file" not in verify_names
         full_payload = reg.openai_tools()
         narrow = reg.openai_tools(names=explore_names)
@@ -701,7 +1061,7 @@ def main() -> None:
         assert sess_u["turns"][-1]["context_usage"]["remaining_pct"] == 55
 
         schemas = reg.openai_tools()
-        assert len(schemas) == 11
+        assert len(schemas) == len(reg.names()) == 14
         assert any(s["function"]["name"] == "load_skill" for s in schemas)
 
         todo_out = reg.dispatch(

@@ -108,11 +108,20 @@ def compress_tool_result(
         return _clip(result, hard_limit if tier == "full" else min(hard_limit, soft_limit))
 
     name = (tool_name or "").lower()
-    if name == "run_shell":
+    if name in {"run_shell", "run_tests"}:
         compressed = _compress_shell(result)
     elif name == "todo_write":
         return result  # already compact checklist
-    elif name in {"read_file", "list_dir", "glob", "grep", "memory_search", "rag_search"}:
+    elif name in {
+        "read_file",
+        "list_dir",
+        "glob",
+        "grep",
+        "memory_search",
+        "rag_search",
+        "git_status",
+        "git_diff",
+    }:
         compressed = _compress_readish(result, soft_limit)
     elif name in {"write_file", "edit_file"}:
         return _clip(result, soft_limit)

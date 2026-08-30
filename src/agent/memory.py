@@ -139,8 +139,11 @@ def format_turn_summary(
         "max_steps": "达到最大步数",
         "interrupted": "已中断",
         "loop_detected": "检测到重复操作，已停止",
+        "cycle_detected": "检测到交替转圈，已停止",
+        "stagnation_detected": "检测到输出停滞，已停止",
         "retry_exhausted": "多次失败后已停止",
         "goal_met_forced": "测试已通过，已自动结束",
+        "budget_exhausted": "任务 token 预算耗尽，已停止",
         "interrupted": "已按你的要求停止",
     }.get(stopped_reason, stopped_reason)
 
@@ -176,6 +179,15 @@ def format_turn_summary(
             f"({usage.get('used_tokens')}/{usage.get('budget_tokens')} tok，"
             f"level={usage.get('level')})"
         )
+    if isinstance(mem, dict):
+        cr = mem.get("cost_report")
+        if isinstance(cr, dict) and cr.get("summary"):
+            lines.append(f"- **成本：** {cr['summary']}")
+        elif isinstance(cr, dict) and cr.get("tokens_total_est") is not None:
+            lines.append(
+                f"- **成本：** ≈{cr.get('tokens_total_est')} tok · "
+                f"{cr.get('tool_calls_total', 0)} tool calls"
+            )
     lines.append(
         "- **续写提示：** 后续任务可依赖 MEMORY.md / working_memory；"
         "细节以磁盘文件为准，必要时 read_file。"

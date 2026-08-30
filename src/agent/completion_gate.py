@@ -65,7 +65,7 @@ def build_evidence_nudge_message(task_state: TaskState) -> str:
     return (
         f"{EVIDENCE_NUDGE_MARKER} 完成判定被拒绝：尚无可验证证据。"
         f"你宣称任务已完成，但测试尚未通过。"
-        f"请用 run_shell 运行相关测试（如 pytest / python *_test.py），"
+        f"请用 run_tests（推荐，如 target=greeter_test.py）或 run_shell 运行相关测试，"
         f"通过后再用简体中文给出 FINAL 答复。\n"
         f"相关文件：{files}。{summary}"
     )

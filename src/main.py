@@ -61,6 +61,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Approx token budget for Context Manager (default: CONTEXT_TOKEN_BUDGET or 32000).",
     )
     p.add_argument(
+        "--max-task-tokens",
+        type=int,
+        default=None,
+        help="Hard cumulative token cap for the whole run (default: MAX_TASK_TOKENS or 0=off).",
+    )
+    p.add_argument(
         "--transcript-dir",
         default=None,
         help="Directory for JSON transcripts (default: transcripts/). Use 'off' to disable.",
@@ -80,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
             transcript_dir=args.transcript_dir,
             max_messages=args.max_messages,
             context_token_budget=args.context_budget,
+            max_task_tokens=args.max_task_tokens,
         )
     except ValueError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
@@ -112,7 +119,8 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"[config] approval={config.approval.value} "
         f"max_messages={config.max_messages} "
-        f"context_budget≈{config.context_token_budget}"
+        f"context_budget≈{config.context_token_budget} "
+        f"max_task_tokens={config.max_task_tokens or 'off'}"
     )
 
     result = run_agent(
@@ -125,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
         max_messages=config.max_messages,
         context_token_budget=config.context_token_budget,
         transcript_dir=config.transcript_dir,
+        max_task_tokens=config.max_task_tokens,
     )
 
     if config.transcript_dir is not None:

@@ -35,6 +35,8 @@ _READONLY = frozenset(
         "load_skill",
         "memory_search",
         "rag_search",
+        "git_status",
+        "git_diff",
     }
 )
 _PHASE_ALLOW: dict[str, frozenset[str] | None] = {
@@ -43,7 +45,7 @@ _PHASE_ALLOW: dict[str, frozenset[str] | None] = {
     # Edit: full toolkit (still gated by PermissionGate)
     "edit": None,
     # Verify: tests + quick fix; hide write_file (prefer edit_file)
-    "verify": _READONLY | frozenset({"run_shell", "edit_file"}),
+    "verify": _READONLY | frozenset({"run_shell", "run_tests", "edit_file"}),
     # Full: no filter
     "full": None,
 }

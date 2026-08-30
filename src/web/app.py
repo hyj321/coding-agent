@@ -412,6 +412,11 @@ async def run_stream(body: RunRequest) -> StreamingResponse:
                 cancel_event=cancel_event,
                 steer_inbox=steer_inbox,
             )
+            cost = None
+            if isinstance(result.memory, dict):
+                cr = result.memory.get("cost_report")
+                if isinstance(cr, dict):
+                    cost = cr
             emit(
                 {
                     "type": "done",
@@ -423,6 +428,7 @@ async def run_stream(body: RunRequest) -> StreamingResponse:
                     "transcript": str(transcript_path) if transcript_path else None,
                     "transcript_id": transcript_path.name if transcript_path else None,
                     "session_id": session_id,
+                    "cost_report": cost,
                 }
             )
         except Exception as exc:  # noqa: BLE001
