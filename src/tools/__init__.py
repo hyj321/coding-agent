@@ -14,6 +14,7 @@ from src.tools.filesystem import register_filesystem_tools
 from src.tools.memory_search import register_memory_search_tools
 from src.tools.rag_search import register_rag_search_tools
 from src.tools.shell import register_shell_tools
+from src.tools.skills import register_skill_tools
 from src.tools.todo import TodoStore, register_todo_tools
 
 
@@ -27,6 +28,7 @@ def build_default_registry(
     register_filesystem_tools(registry, gate, max_output_chars=max_output_chars)
     register_shell_tools(registry, gate, max_output_chars=max_output_chars)
     register_todo_tools(registry, TodoStore())
+    register_skill_tools(registry)
     register_memory_search_tools(
         registry,
         workdir=gate.workdir,
@@ -37,4 +39,5 @@ def build_default_registry(
         workdir=gate.workdir,
         transcript_dir=transcript_dir,
     )
+    gate.bind_registry(registry)
     return registry

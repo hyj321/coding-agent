@@ -8,11 +8,43 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from src.agent.context import ContextManager, trim_messages
-from src.agent.memory import append_run_to_memory, load_working_memory, save_working_memory
+from src.agent.completion_gate import (
+    build_evidence_nudge_message,
+    note_completion_nudge,
+    should_block_completion,
+)
+from src.agent.context import ContextManager, sanitize_tool_pairing, trim_messages
+from src.agent.loop_guard import LoopGuard, tool_call_fingerprint
+from src.agent.memory import (
+    append_run_to_memory,
+    format_turn_summary,
+    load_working_memory,
+    save_turn_summary_file,
+    save_working_memory,
+)
 from src.agent.permissions import PermissionGate
+from src.agent.retry_policy import RetryPolicy
+from src.agent.stop_conditions import (
+    build_final_nudge_message,
+    clear_nudge_state,
+    evaluate_final_nudge,
+    force_stop_message,
+    is_mutating_tool,
+    post_nudge_mutating_suffix,
+    reasons_allow_force_stop,
+    should_force_stop_after_nudge,
+)
+from src.agent.tool_visibility import infer_phase, visible_tool_names
 from src.llm.client import LLMClient
 from src.tools.base import ToolRegistry
+
+# Re-export for smoke tests / callers that imported from loop
+__all__ = [
+    "AgentResult",
+    "LoopGuard",
+    "run_agent",
+    "tool_call_fingerprint",
+]
 
 LogFn = Callable[[str], None]
 EventFn = Callable[[dict[str, Any]], None]
@@ -26,7 +58,7 @@ def _default_log(msg: str) -> None:
 class AgentResult:
     final_text: str
     steps: int
-    stopped_reason: str  # completed | max_steps | interrupted
+    stopped_reason: str  # completed | max_steps | interrupted | loop_detected | retry_exhausted | goal_met_forced
     messages: list[dict[str, Any]] = field(default_factory=list)
     memory: dict[str, Any] | None = None
 
@@ -157,7 +189,7 @@ def run_agent(
     if ctx is None and workdir is not None:
         budget = context_token_budget
         if budget is None:
-            budget = int(getattr(client.config, "context_token_budget", 8000) or 8000)
+            budget = int(getattr(client.config, "context_token_budget", 32000) or 32000)
         ctx = ContextManager(
             workdir=workdir,
             tool_names=registry.names(),
@@ -169,7 +201,6 @@ def run_agent(
     if ctx is not None and prior_memory:
         ctx.import_memory(prior_memory)
     elif ctx is not None and workdir is not None and not prior_messages:
-        # New run: hydrate from dual-track working_memory.json if present
         disk_wm = load_working_memory(workdir)
         if disk_wm:
             ctx.import_memory(disk_wm)
@@ -188,14 +219,30 @@ def run_agent(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_task},
         ]
+    messages = sanitize_tool_pairing(messages)
     if ctx is not None:
-        ctx.state.task = user_task
-    tools = registry.openai_tools()
+        ctx.ensure_task_goal(user_task)
+        # Each new user message may ask for more edits — never inherit a stale
+        # "already nudged / force-stop" latch from a previous turn.
+        clear_nudge_state(ctx.task_state)
+        ctx.post_nudge_mutating = 0
+    tools = registry.openai_tools()  # may be narrowed each step when visibility=auto
+    cfg = client.config
 
-    log(f"[agent] model={client.config.model} max_steps={max_steps}")
+    log(f"[agent] model={cfg.model} max_steps={max_steps}")
     log(f"[agent] tools={', '.join(registry.names())}")
     if gate is not None:
-        log(f"[agent] approval={gate.approval.value}")
+        log(
+            f"[agent] approval={gate.approval.value}"
+            + (f" deny_high={gate.deny_high}" if getattr(gate, "deny_high", False) else "")
+        )
+    tool_visibility = str(getattr(cfg, "tool_visibility", "auto") or "auto")
+    completion_mode = str(getattr(cfg, "completion_mode", "evidence") or "evidence")
+    evidence_nudge_max = int(getattr(cfg, "evidence_nudge_max", 2) or 2)
+    log(
+        f"[agent] tool_visibility={tool_visibility} "
+        f"completion_mode={completion_mode} evidence_nudge_max={evidence_nudge_max}"
+    )
     if ctx is not None:
         log(f"[agent] context_budget≈{ctx.token_budget} tokens (ACON-style manager)")
         if ctx.state.project_memory:
@@ -220,7 +267,35 @@ def run_agent(
         }
     )
 
+    loop_guard = LoopGuard.from_env(
+        warn_after=getattr(cfg, "loop_warn_after", None),
+        stop_after=getattr(cfg, "loop_stop_after", None),
+        error_nudge_after=getattr(cfg, "loop_error_nudge_after", None),
+    )
+    retry_max = int(getattr(cfg, "retry_max_failures", 3) or 3)
+    nudge_mutating_limit = int(getattr(cfg, "final_nudge_mutating_limit", 2) or 2)
+    if ctx is not None:
+        # Prefer config over whatever was hydrated; keep failed history
+        ctx.retry_policy.max_failures = retry_max
+    else:
+        # No context manager — still track retries locally
+        pass
+    retry_policy = ctx.retry_policy if ctx is not None else RetryPolicy(max_failures=retry_max)
+    log(
+        f"[agent] loop_guard warn={loop_guard.warn_after} "
+        f"stop={loop_guard.stop_after} error_nudge={loop_guard.error_nudge_after} "
+        f"retry_max={retry_max} final_nudge_mutating_limit={nudge_mutating_limit}"
+    )
+
     def _finish(result: AgentResult) -> AgentResult:
+        usage = None
+        if ctx is not None:
+            usage = ctx.usage_report(result.messages, scope="turn")
+            emit({"type": "context_usage", **usage})
+            if result.memory is None:
+                result.memory = ctx.export_memory()
+            if isinstance(result.memory, dict) and usage is not None:
+                result.memory["context_usage"] = usage
         if ctx is not None and workdir is not None and result.memory is not None:
             wm_path = save_working_memory(
                 workdir,
@@ -230,25 +305,82 @@ def run_agent(
             if wm_path is not None:
                 log(f"[memory] working_memory → {wm_path}")
                 emit({"type": "working_memory_write", "path": str(wm_path)})
+                ts = result.memory.get("task_state") if isinstance(result.memory, dict) else None
+                if ts:
+                    emit({"type": "task_state", "task_state": ts})
         if persist_memory_md and ctx is not None and workdir is not None:
+            summary = format_turn_summary(
+                task=user_task,
+                final_text=result.final_text,
+                stopped_reason=result.stopped_reason,
+                memory=result.memory,
+                usage=usage,
+            )
+            if result.memory is not None:
+                result.memory["turn_summary"] = summary
             mem_path = append_run_to_memory(
                 workdir,
                 task=user_task,
                 final_text=result.final_text,
                 stopped_reason=result.stopped_reason,
                 memory=result.memory,
+                usage=usage,
             )
             if mem_path is not None:
                 log(f"[memory] appended → {mem_path}")
                 emit({"type": "memory_write", "path": str(mem_path)})
+            summary_path = save_turn_summary_file(workdir, summary)
+            emit(
+                {
+                    "type": "turn_summary",
+                    "text": summary,
+                    "path": str(summary_path) if summary_path else None,
+                    "context_usage": usage,
+                }
+            )
+            log("[memory] turn summary written")
         return result
 
     try:
         for step in range(1, max_steps + 1):
             log(f"\n=== step {step}/{max_steps} ===")
             emit({"type": "step_start", "step": step, "max_steps": max_steps})
+
+            # Least-privilege: narrow visible tools from todo phase (optional)
+            if tool_visibility == "auto":
+                todos_text = ctx.state.todos_text if ctx is not None else ""
+                goal = ctx.task_state.goal if ctx is not None else user_task
+                files_mutated = bool(ctx and ctx.task_state.files_mutated)
+                tests_passed = (
+                    ctx.task_state.test_status.passed
+                    if ctx and ctx.task_state.test_status
+                    else None
+                )
+                phase = infer_phase(
+                    todos_text=todos_text,
+                    goal=goal,
+                    files_mutated=files_mutated,
+                    tests_passed=tests_passed,
+                )
+                vis_names = visible_tool_names(registry, phase)
+                tools = registry.openai_tools(names=vis_names)
+                if ctx is not None:
+                    ctx.task_state.tool_phase = phase
+                log(f"[tool_visibility] phase={phase} tools={', '.join(vis_names)}")
+                emit(
+                    {
+                        "type": "tool_visibility",
+                        "step": step,
+                        "phase": phase,
+                        "tools": vis_names,
+                    }
+                )
+            else:
+                tools = registry.openai_tools()
+
             if ctx is not None:
                 model_messages = ctx.prepare_messages(messages, user_task=user_task)
+                emit({"type": "context_usage", **ctx.usage_report(model_messages, scope="turn")})
             else:
                 model_messages = trim_messages(messages, max_messages=max_messages)
             response = client.chat(model_messages, tools=tools)
@@ -260,6 +392,42 @@ def run_agent(
             tool_calls = assistant_dict.get("tool_calls") or []
             if not tool_calls:
                 final = (assistant_dict.get("content") or "").strip()
+                # Completion Evidence Gate: refuse "done" without tests when required
+                if ctx is not None:
+                    block, why = should_block_completion(
+                        ctx.task_state,
+                        completion_mode=completion_mode,
+                        max_nudges=evidence_nudge_max,
+                    )
+                    if block:
+                        n = note_completion_nudge(ctx.task_state)
+                        nudge = build_evidence_nudge_message(ctx.task_state)
+                        messages.append({"role": "user", "content": nudge})
+                        log(f"[completion_gate] blocked ({why}); nudge {n}/{evidence_nudge_max}")
+                        emit(
+                            {
+                                "type": "completion_gate",
+                                "step": step,
+                                "blocked": True,
+                                "reason": why,
+                                "nudge": n,
+                                "max_nudges": evidence_nudge_max,
+                                "text": nudge,
+                            }
+                        )
+                        emit({"type": "step_end", "step": step, "kind": "completion_gate"})
+                        continue
+                    if why.startswith("evidence nudge budget"):
+                        log(f"[completion_gate] allowing complete without evidence ({why})")
+                        emit(
+                            {
+                                "type": "completion_gate",
+                                "step": step,
+                                "blocked": False,
+                                "reason": why,
+                            }
+                        )
+
                 log(f"[agent] final:\n{final}")
                 emit({"type": "final", "step": step, "text": final, "stopped_reason": "completed"})
                 emit({"type": "step_end", "step": step, "kind": "final"})
@@ -277,6 +445,9 @@ def run_agent(
                 think = assistant_dict["content"]
                 log(f"[think] {think}")
                 emit({"type": "think", "step": step, "text": think})
+
+            loop_guard.begin_step()
+            step_had_failure = False
 
             for tc in tool_calls:
                 name = tc["function"]["name"]
@@ -296,6 +467,21 @@ def run_agent(
                 )
 
                 parsed = _parse_args(raw_args)
+                fp_args: dict[str, Any] | str = parsed if isinstance(parsed, dict) else raw_args
+                streak, fp = loop_guard.observe(name, fp_args)
+                if streak >= loop_guard.warn_after:
+                    log(f"[loop_guard] streak={streak} tool={name}")
+                    emit(
+                        {
+                            "type": "loop_warning",
+                            "step": step,
+                            "name": name,
+                            "streak": streak,
+                            "fingerprint": fp[:200],
+                            "will_stop": streak >= loop_guard.stop_after,
+                        }
+                    )
+
                 before_text: str | None = None
                 rel_path: str | None = None
                 resolved_path = None
@@ -313,12 +499,45 @@ def run_agent(
                         resolved_path = None
                         rel_path = str(parsed.get("path") or "")
 
-                if isinstance(parsed, str):
+                reused = False
+                cached = loop_guard.same_step_lookup(fp)
+                if cached is not None:
+                    result = LoopGuard.dedup_reuse_message(name, cached)
+                    reused = True
+                    log(f"[dedup] reusing same-step result for {name}")
+                    emit(
+                        {
+                            "type": "action_dedup",
+                            "step": step,
+                            "id": call_id,
+                            "name": name,
+                            "fingerprint": fp[:200],
+                        }
+                    )
+                elif isinstance(parsed, str):
                     result = parsed
                 elif gate is not None:
-                    decision = gate.authorize(name, parsed)
+                    decision = gate.authorize(name, parsed, call_id=call_id)
+                    if decision.allowed and "user approved" in decision.reason:
+                        decision_label = "confirm"
+                    elif decision.allowed:
+                        decision_label = "allow"
+                    else:
+                        decision_label = "deny"
+                    emit(
+                        {
+                            "type": "auth_decision",
+                            "step": step,
+                            "id": call_id,
+                            "name": name,
+                            "allowed": decision.allowed,
+                            "reason": decision.reason,
+                            "risk_level": decision.risk_level,
+                            "decision": decision_label,
+                        }
+                    )
                     if not decision.allowed:
-                        result = f"Error: tool denied by permission gate: {decision.reason}"
+                        result = f"错误：权限门拒绝了该工具 — {decision.reason}"
                         log(f"[deny] {result}")
                     else:
                         result = registry.dispatch(name, parsed)
@@ -326,15 +545,211 @@ def run_agent(
                     result = registry.dispatch(name, parsed)
 
                 stored = result
-                if ctx is not None:
+                if ctx is not None and not reused:
                     stored = ctx.observe_tool(
                         step=step,
                         tool_name=name,
                         raw_args=parsed if isinstance(parsed, dict) else raw_args,
                         result=result,
                     )
+                elif ctx is not None and reused:
+                    ctx.task_state.update_from_tool(
+                        tool_name=name,
+                        args=parsed if isinstance(parsed, dict) else None,
+                        result=cached or result,
+                        paths=None,
+                    )
 
-                ok = not str(result).startswith("Error")
+                if not reused:
+                    loop_guard.same_step_store(fp, stored)
+
+                # Outcome for error-streak: use underlying tool body, not dedup wrapper
+                body_for_ok = cached if reused else result
+                ok = not str(body_for_ok).startswith("Error")
+                # Test failures via exit_code also count as not-ok for streak
+                if ok and isinstance(body_for_ok, str):
+                    if re.search(r"(?m)^(FAILED|ERROR)\b|exit_code:\s*[1-9]", body_for_ok):
+                        ok = False
+
+                err_streak = loop_guard.record_outcome(fp, ok=ok)
+                if err_streak >= loop_guard.error_nudge_after:
+                    log(f"[loop_guard] error_streak={err_streak} tool={name}")
+                    emit(
+                        {
+                            "type": "error_streak",
+                            "step": step,
+                            "name": name,
+                            "error_streak": err_streak,
+                            "fingerprint": fp[:200],
+                        }
+                    )
+
+                if not ok:
+                    step_had_failure = True
+                    retry_decision = retry_policy.record_failure(
+                        tool_name=name,
+                        args=parsed if isinstance(parsed, dict) else None,
+                        result=str(body_for_ok),
+                    )
+                    if ctx is not None:
+                        ctx._sync_task_retry_fields()
+                    log(
+                        f"[retry_policy] key={retry_decision.key} "
+                        f"stage={retry_decision.stage}/{retry_policy.max_failures} "
+                        f"count={retry_decision.count}"
+                    )
+                    emit(
+                        {
+                            "type": "retry_stage",
+                            "step": step,
+                            "name": name,
+                            "failure_key": retry_decision.key,
+                            "stage": retry_decision.stage,
+                            "count": retry_decision.count,
+                            "max_failures": retry_policy.max_failures,
+                            "will_stop": retry_decision.should_stop,
+                            "failed_strategies": [
+                                s.to_dict() for s in list(retry_policy.by_key.values())[:8]
+                            ],
+                        }
+                    )
+                    if retry_decision.suffix:
+                        stored = f"{stored}{retry_decision.suffix}"
+                    if retry_decision.should_stop:
+                        result_summary = _summarize_result(stored)
+                        log(f"[result] {result_summary}")
+                        emit(
+                            {
+                                "type": "tool_result",
+                                "step": step,
+                                "id": call_id,
+                                "name": name,
+                                "ok": False,
+                                "result": stored if len(stored) <= 4000 else stored[:4000] + "\n...[truncated]",
+                                "result_summary": result_summary,
+                                "compressed": (not reused) and stored != result,
+                                "dedup": reused,
+                            }
+                        )
+                        if ctx is not None:
+                            emit(
+                                {
+                                    "type": "task_state",
+                                    "step": step,
+                                    "task_state": ctx.task_state.to_dict(),
+                                    "retry_stage": ctx.task_state.retry_stage,
+                                    "failed_strategies": ctx.task_state.failed[:8],
+                                }
+                            )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call_id,
+                                "content": stored,
+                            }
+                        )
+                        final = (
+                            f"(stopped: strategy `{retry_decision.key}` failed "
+                            f"{retry_decision.count} times — retry_exhausted)"
+                        )
+                        log(f"[agent] {final}")
+                        emit(
+                            {
+                                "type": "final",
+                                "step": step,
+                                "text": final,
+                                "stopped_reason": "retry_exhausted",
+                            }
+                        )
+                        emit({"type": "step_end", "step": step, "kind": "retry_exhausted"})
+                        return _finish(
+                            AgentResult(
+                                final_text=final,
+                                steps=step,
+                                stopped_reason="retry_exhausted",
+                                messages=messages,
+                                memory=ctx.export_memory() if ctx is not None else None,
+                            )
+                        )
+
+                # After tests-passed nudge only: mutating tools may escalate to force-stop
+                if (
+                    ctx is not None
+                    and ctx.task_state.final_nudge_sent
+                    and reasons_allow_force_stop(ctx.task_state.stop_nudge_reasons)
+                    and is_mutating_tool(name)
+                    and not reused
+                ):
+                    ctx.post_nudge_mutating += 1
+                    stored = (
+                        f"{stored}"
+                        f"{post_nudge_mutating_suffix(count=ctx.post_nudge_mutating, limit=nudge_mutating_limit)}"
+                    )
+                    emit(
+                        {
+                            "type": "final_nudge_warning",
+                            "step": step,
+                            "name": name,
+                            "post_nudge_mutating": ctx.post_nudge_mutating,
+                            "limit": nudge_mutating_limit,
+                        }
+                    )
+                    if should_force_stop_after_nudge(
+                        mutating_count=ctx.post_nudge_mutating,
+                        limit=nudge_mutating_limit,
+                        reasons=ctx.task_state.stop_nudge_reasons,
+                    ):
+                        result_summary = _summarize_result(stored)
+                        log(f"[result] {result_summary}")
+                        emit(
+                            {
+                                "type": "tool_result",
+                                "step": step,
+                                "id": call_id,
+                                "name": name,
+                                "ok": ok,
+                                "result": stored if len(stored) <= 4000 else stored[:4000] + "\n...[truncated]",
+                                "result_summary": result_summary,
+                                "compressed": (not reused) and stored != result,
+                                "dedup": reused,
+                            }
+                        )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call_id,
+                                "content": stored,
+                            }
+                        )
+                        reasons = list(ctx.task_state.stop_nudge_reasons)
+                        final = force_stop_message(reasons)
+                        log(f"[agent] {final}")
+                        emit(
+                            {
+                                "type": "final",
+                                "step": step,
+                                "text": final,
+                                "stopped_reason": "goal_met_forced",
+                            }
+                        )
+                        emit({"type": "step_end", "step": step, "kind": "goal_met_forced"})
+                        return _finish(
+                            AgentResult(
+                                final_text=final,
+                                steps=step,
+                                stopped_reason="goal_met_forced",
+                                messages=messages,
+                                memory=ctx.export_memory(),
+                            )
+                        )
+
+                warn = loop_guard.warning_suffix(name, streak)
+                if warn:
+                    stored = f"{stored}{warn}"
+                nudge = loop_guard.error_nudge_suffix(name, err_streak)
+                if nudge and (not warn or "STOP" not in warn):
+                    stored = f"{stored}{nudge}"
+
                 result_summary = _summarize_result(stored)
                 log(f"[result] {result_summary}")
                 emit(
@@ -346,15 +761,23 @@ def run_agent(
                         "ok": ok,
                         "result": stored if len(stored) <= 4000 else stored[:4000] + "\n...[truncated]",
                         "result_summary": result_summary,
-                        "compressed": stored != result,
+                        "compressed": (not reused) and stored != result,
+                        "dedup": reused,
                     }
                 )
-                if name == "todo_write":
+                if name == "todo_write" and not reused:
                     todos = _parse_todo_lines(result)
                     if todos is not None:
                         emit({"type": "todo_update", "step": step, "todos": todos})
-                if ok and name in _MUTATING_FILE_TOOLS and rel_path is not None:
-                    after_text = _snapshot_text(resolved_path) if resolved_path is not None else None
+                if (
+                    ok
+                    and not reused
+                    and name in _MUTATING_FILE_TOOLS
+                    and rel_path is not None
+                ):
+                    after_text = (
+                        _snapshot_text(resolved_path) if resolved_path is not None else None
+                    )
                     if after_text is None and isinstance(parsed, dict) and "content" in parsed:
                         after_text = str(parsed.get("content") or "")
                     emit(
@@ -364,9 +787,24 @@ def run_agent(
                             "id": call_id,
                             "tool": name,
                             "path": rel_path,
-                            "old_content": _clip_diff(before_text if before_text is not None else ""),
-                            "new_content": _clip_diff(after_text if after_text is not None else ""),
+                            "old_content": _clip_diff(
+                                before_text if before_text is not None else ""
+                            ),
+                            "new_content": _clip_diff(
+                                after_text if after_text is not None else ""
+                            ),
                             "is_new": before_text is None,
+                        }
+                    )
+
+                if ctx is not None:
+                    emit(
+                        {
+                            "type": "task_state",
+                            "step": step,
+                            "task_state": ctx.task_state.to_dict(),
+                            "retry_stage": ctx.task_state.retry_stage,
+                            "failed_strategies": ctx.task_state.failed[:8],
                         }
                     )
 
@@ -377,6 +815,53 @@ def run_agent(
                         "content": stored,
                     }
                 )
+
+                if streak >= loop_guard.stop_after:
+                    final = (
+                        f"(stopped: identical tool `{name}` repeated {streak} times "
+                        f"with the same arguments — loop_detected)"
+                    )
+                    log(f"[agent] {final}")
+                    emit(
+                        {
+                            "type": "final",
+                            "step": step,
+                            "text": final,
+                            "stopped_reason": "loop_detected",
+                        }
+                    )
+                    emit({"type": "step_end", "step": step, "kind": "loop_detected"})
+                    return _finish(
+                        AgentResult(
+                            final_text=final,
+                            steps=step,
+                            stopped_reason="loop_detected",
+                            messages=messages,
+                            memory=ctx.export_memory() if ctx is not None else None,
+                        )
+                    )
+
+            # Soft stop: tests passed / todos done → urge FINAL (once)
+            if ctx is not None and not ctx.task_state.final_nudge_sent:
+                urge, reasons = evaluate_final_nudge(
+                    task_state=ctx.task_state,
+                    todos_text=ctx.state.todos_text,
+                    step_had_failure=step_had_failure,
+                )
+                if urge:
+                    nudge_msg = build_final_nudge_message(reasons, task_state=ctx.task_state)
+                    messages.append({"role": "user", "content": nudge_msg})
+                    ctx.task_state.final_nudge_sent = True
+                    ctx.task_state.stop_nudge_reasons = list(reasons)
+                    log(f"[stop_condition] final nudge: {', '.join(reasons)}")
+                    emit(
+                        {
+                            "type": "final_nudge",
+                            "step": step,
+                            "reasons": reasons,
+                            "text": nudge_msg,
+                        }
+                    )
 
             emit({"type": "step_end", "step": step, "kind": "tools"})
 

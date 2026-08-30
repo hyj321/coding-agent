@@ -8,17 +8,21 @@ from pathlib import Path
 from typing import Any, Callable
 
 from src.agent.context import build_system_prompt
+from src.agent.compress import estimate_messages_tokens
+from src.agent.context_manager import context_usage_report
 from src.agent.loop import AgentResult, run_agent
-from src.agent.permissions import ApprovalMode, PermissionGate
+from src.agent.permissions import ApprovalMode, AskFn, PermissionGate
 from src.agent.transcript import (
     append_session_file_changes,
     build_continue_context,
     load_session,
+    resolve_continue_task,
     save_transcript,
 )
 from src.config import Config
 from src.llm.client import LLMClient
 from src.tools import build_default_registry
+from src.tools.fs_noise import is_agent_scratch, is_noise_entry
 
 LogFn = Callable[[str], None]
 EventFn = Callable[[dict[str, Any]], None]
@@ -47,7 +51,6 @@ if __name__ == "__main__":
 '''
 
 _SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{8,64}$")
-_SKIP_DIR_NAMES = {".git", "__pycache__", ".venv", "node_modules", ".mypy_cache", ".pytest_cache"}
 
 
 def resolve_workdir(workdir: str | Path | None) -> Path:
@@ -68,9 +71,8 @@ def list_directory(path: Path, *, max_entries: int = 200) -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     children = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
     for child in children:
-        if child.name in _SKIP_DIR_NAMES or child.name.startswith("."):
-            if child.name not in {".env.example"}:
-                continue
+        if is_noise_entry(child.name):
+            continue
         try:
             entries.append(
                 {
@@ -108,9 +110,7 @@ def build_tree(workdir: Path, *, max_depth: int = 3, max_nodes: int = 250) -> di
         except OSError:
             return
         for child in children:
-            if child.name in _SKIP_DIR_NAMES:
-                continue
-            if child.name.startswith(".") and child.name not in {".env.example"}:
+            if is_noise_entry(child.name):
                 continue
             count += 1
             if count > max_nodes:
@@ -154,6 +154,39 @@ def read_workdir_file(workdir: Path, rel_path: str, *, max_chars: int = 200_000)
     }
 
 
+def write_workdir_file(workdir: Path, rel_path: str, content: str) -> dict[str, Any]:
+    """Write UTF-8 text under workdir (for UI undo/redo of a diff)."""
+    root = workdir.resolve()
+    target = (root / rel_path).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise PermissionError("path escapes workdir") from exc
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content if content is not None else "", encoding="utf-8", newline="\n")
+    return {
+        "path": rel_path.replace("\\", "/"),
+        "workdir": str(root),
+        "bytes": target.stat().st_size,
+    }
+
+
+def delete_workdir_file(workdir: Path, rel_path: str) -> dict[str, Any]:
+    """Delete a file under workdir (undo a newly created file)."""
+    root = workdir.resolve()
+    target = (root / rel_path).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise PermissionError("path escapes workdir") from exc
+    if not target.exists():
+        return {"path": rel_path.replace("\\", "/"), "deleted": False, "reason": "missing"}
+    if not target.is_file():
+        raise ValueError("not a file")
+    target.unlink()
+    return {"path": rel_path.replace("\\", "/"), "deleted": True}
+
+
 def run_coding_task(
     *,
     task: str,
@@ -165,6 +198,9 @@ def run_coding_task(
     log: LogFn | None = None,
     on_event: EventFn | None = None,
     session_id: str | None = None,
+    ask_fn: AskFn | None = None,
+    ask_min_risk: str = "medium",
+    deny_high: bool | None = None,
 ) -> tuple[AgentResult, Config, Path | None]:
     config = Config.from_env(
         workdir=workdir,
@@ -174,9 +210,28 @@ def run_coding_task(
         transcript_dir=None if save_run_transcript else "off",
     )
 
-    gate = PermissionGate(config.workdir, approval=config.approval)
-    if gate.approval == ApprovalMode.ASK:
-        gate = PermissionGate(config.workdir, approval=ApprovalMode.AUTO)
+    # Web interactive: approval=ask + ask_fn; deny_high off so user can Allow High
+    if ask_fn is not None:
+        mode = ApprovalMode.ASK
+        high_deny = False if deny_high is None else deny_high
+    else:
+        mode = config.approval
+        # Legacy Web path without ask_fn: auto + deny high
+        high_deny = True if deny_high is None else deny_high
+        if mode == ApprovalMode.ASK:
+            # No ask_fn (e.g. misconfigured) — fall back to auto+deny_high
+            mode = ApprovalMode.AUTO
+            high_deny = True if deny_high is None else deny_high
+
+    min_risk = ask_min_risk if ask_min_risk in {"low", "medium", "high"} else "medium"
+
+    gate = PermissionGate(
+        config.workdir,
+        approval=mode,
+        ask_fn=ask_fn,
+        deny_high=high_deny,
+        ask_min_risk=min_risk,  # type: ignore[arg-type]
+    )
 
     registry = build_default_registry(
         gate,
@@ -189,11 +244,28 @@ def run_coding_task(
     prior_messages: list[dict[str, Any]] | None = None
     prior_memory: dict[str, Any] | None = None
     sid = session_id.strip() if session_id and _SESSION_ID_RE.match(session_id.strip()) else None
+    effective_task = task
     if sid and config.transcript_dir is not None:
         prev = load_session(config.transcript_dir, sid)
         if prev and prev.get("messages"):
-            # P0: slim continue — memory snapshot + recent K + original task
-            prior_messages, prior_memory = build_continue_context(prev, recent_k=12)
+            # Expand 「继续做」→ explicit unfinished goal; slim prior context
+            effective_task = resolve_continue_task(task, prev)
+            if effective_task != task and log is not None:
+                log(f"[session] continue resolved → {effective_task[:120]!r}")
+            prior_messages, prior_memory = build_continue_context(prev, recent_k=24)
+            # Session-level pressure: how much prior already eats the budget
+            if on_event is not None:
+                prior_tokens = estimate_messages_tokens(prior_messages)
+                on_event(
+                    {
+                        "type": "context_usage",
+                        **context_usage_report(
+                            used_tokens=prior_tokens,
+                            budget_tokens=config.context_token_budget,
+                            scope="session",
+                        ),
+                    }
+                )
 
     file_changes: list[dict[str, Any]] = []
 
@@ -216,7 +288,7 @@ def run_coding_task(
         client=client,
         registry=registry,
         system_prompt=system_prompt,
-        user_task=task,
+        user_task=effective_task,
         max_steps=config.max_steps,
         gate=gate,
         max_messages=config.max_messages,
@@ -230,6 +302,7 @@ def run_coding_task(
 
     transcript_path: Path | None = None
     if save_run_transcript and config.transcript_dir is not None:
+        # Persist the user-visible utterance; resolved continue text is in messages
         transcript_path = save_transcript(
             config.transcript_dir,
             task=task,
@@ -240,6 +313,7 @@ def run_coding_task(
                 "approval": gate.approval.value,
                 "source": "web",
                 "session_id": sid,
+                "resolved_task": effective_task if effective_task != task else None,
             },
             session_id=sid,
         )
@@ -305,7 +379,9 @@ def get_transcript(transcript_id: str) -> dict[str, Any] | None:
 
 
 def reset_demo_files() -> dict[str, Any]:
-    """Restore intentional bugs so demos remain reproducible."""
+    """Restore intentional bugs so demos remain reproducible; purge agent scratch files."""
+    import shutil
+
     demos = PROJECT_ROOT / "demos"
     written: list[str] = []
     mapping = {
@@ -315,4 +391,18 @@ def reset_demo_files() -> dict[str, Any]:
     for path, content in mapping.items():
         path.write_text(content, encoding="utf-8", newline="\n")
         written.append(str(path.relative_to(PROJECT_ROOT)).replace("\\", "/"))
-    return {"reset": written}
+
+    removed: list[str] = []
+    if demos.is_dir():
+        for child in list(demos.iterdir()):
+            if not is_agent_scratch(child.name):
+                continue
+            try:
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+                removed.append(child.name)
+            except OSError:
+                continue
+    return {"reset": written, "removed_scratch": removed}

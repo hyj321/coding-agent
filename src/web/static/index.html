@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=20260829g" />
+  <link rel="stylesheet" href="/static/styles.css?v=20260830k" />
   <script src="https://cdn.jsdelivr.net/npm/marked@15.0.7/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js"></script>
@@ -44,30 +44,12 @@
           <button class="nav-item active" data-view="home" type="button">
             <span class="nav-icon">✦</span> Explore
           </button>
-          <button class="nav-item" id="btnNew" type="button">
-            <span class="nav-icon">＋</span> New task
-          </button>
-          <button class="nav-item" id="btnResetDemos" type="button">
-            <span class="nav-icon">↺</span> Reset demos
-          </button>
-          <a class="nav-item" href="https://github.com/hyj321/coding-agent" target="_blank" rel="noreferrer">
-            <span class="nav-icon">⧉</span> GitHub
-          </a>
-          <button class="nav-item" id="btnRefreshHistory" type="button">
-            <span class="nav-icon">↻</span> History
-          </button>
         </nav>
       </div>
 
       <div class="recent-block">
         <div class="recent-label">RECENT CHATS</div>
         <div id="recentList" class="recent-list"></div>
-      </div>
-
-      <div class="promo">
-        <div class="promo-title">CLI still available</div>
-        <p>Prefer terminal? Run <code>python -m src.main</code></p>
-        <a href="#chatInput">Start coding →</a>
       </div>
     </aside>
 
@@ -86,7 +68,7 @@
           </button>
         </div>
         <div class="topbar-right">
-          <div id="runStatus" class="run-status idle">Idle</div>
+          <div id="runStatus" class="run-status idle">空闲</div>
           <div class="user">
             <div class="avatar">CA</div>
             <div class="user-meta">
@@ -109,10 +91,63 @@
             <div id="timeline" class="timeline"></div>
             <!-- Moved into timeline after FINAL by JS; kept here as template -->
             <div id="changedBar" class="changed-bar hidden">
-              <div class="changed-label">Changed files</div>
+              <div class="changed-label">This turn</div>
               <div id="changedList" class="changed-list"></div>
             </div>
           </section>
+
+          <footer class="composer-wrap">
+            <div id="approvalBar" class="approval-bar hidden" role="alertdialog" aria-live="assertive">
+              <div class="approval-main">
+                <div class="approval-title">
+                  <span class="approval-badge" id="approvalRisk">medium</span>
+                  需要授权
+                </div>
+                <div class="approval-tool" id="approvalTool">tool</div>
+                <pre class="approval-summary" id="approvalSummary"></pre>
+              </div>
+              <div class="approval-actions">
+                <button type="button" id="btnApprovalDeny" class="btn-secondary">拒绝</button>
+                <button type="button" id="btnApprovalAllow" class="btn-primary">允许</button>
+              </div>
+            </div>
+            <div class="workdir-row">
+              <label>
+                Workdir
+                <input id="workdirInput" type="text" value="demos" />
+              </label>
+              <label>
+                Max steps
+                <input id="maxStepsInput" type="number" min="1" max="60" value="30" />
+              </label>
+            </div>
+            <div id="attachChips" class="attach-chips hidden" aria-live="polite"></div>
+            <form id="composer" class="composer" title="可将右侧文件拖到此处">
+              <input id="chatInput" type="text" placeholder="Ask something… 或把右侧文件拖进来" autocomplete="off" />
+              <button
+                type="button"
+                id="contextRing"
+                class="context-ring"
+                data-level="ok"
+                aria-expanded="false"
+                aria-label="上下文用量"
+                title="发送任务后显示用量"
+              >
+                <svg class="context-ring-svg" viewBox="0 0 36 36" aria-hidden="true">
+                  <circle class="context-ring-track" cx="18" cy="18" r="14" />
+                  <circle id="contextRingArc" class="context-ring-arc" cx="18" cy="18" r="14"
+                    stroke-dasharray="87.96" stroke-dashoffset="87.96" />
+                </svg>
+                <span id="contextRingDetail" class="context-ring-detail" hidden>—%</span>
+              </button>
+              <button id="sendBtn" class="send" type="submit" aria-label="Send">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#fff" stroke-width="2.4">
+                  <path d="M12 19V5M12 5l-6 6M12 5l6 6" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </button>
+            </form>
+            <p class="foot-note">拖入右侧文件可作为附件 · Local coding agent · demos in <code>/demos</code></p>
+          </footer>
         </div>
 
         <aside id="rightPanel" class="right-panel">
@@ -131,28 +166,6 @@
           </div>
         </aside>
       </div>
-
-      <footer class="composer-wrap">
-        <div class="workdir-row">
-          <label>
-            Workdir
-            <input id="workdirInput" type="text" value="demos" />
-          </label>
-          <label>
-            Max steps
-            <input id="maxStepsInput" type="number" min="1" max="60" value="20" />
-          </label>
-        </div>
-        <form id="composer" class="composer">
-          <input id="chatInput" type="text" placeholder="Ask something.." autocomplete="off" />
-          <button id="sendBtn" class="send" type="submit" aria-label="Send">
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#fff" stroke-width="2.4">
-              <path d="M12 19V5M12 5l-6 6M12 5l6 6" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-          </button>
-        </form>
-        <p class="foot-note">Local coding agent · one chat = one session history · demos in <code>/demos</code></p>
-      </footer>
     </main>
   </div>
 
@@ -184,6 +197,10 @@
         <div class="vscode-dots" aria-hidden="true"><span></span><span></span><span></span></div>
         <div id="codeTitle" class="vscode-title">file</div>
         <div class="vscode-title-actions">
+          <div id="diffActions" class="diff-actions hidden">
+            <button type="button" id="btnDiffUndo" class="diff-action-btn" title="Restore original (before change)">Undo</button>
+            <button type="button" id="btnDiffRedo" class="diff-action-btn" title="Re-apply modified version">Redo</button>
+          </div>
           <span id="codeModeBadge" class="vscode-badge">Preview</span>
           <button type="button" class="modal-x vscode-x" data-close="code">×</button>
         </div>
@@ -204,6 +221,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=20260829g"></script>
+  <script src="/static/app.js?v=20260830k"></script>
 </body>
 </html>

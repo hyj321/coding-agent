@@ -10,15 +10,17 @@ import asyncio
 import json
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from src.web.approval import ApprovalBridge
 from src.web.runner import (
     build_tree,
+    delete_workdir_file,
     get_transcript,
     list_directory,
     list_recent_transcripts,
@@ -26,27 +28,50 @@ from src.web.runner import (
     reset_demo_files,
     resolve_workdir,
     run_coding_task,
+    write_workdir_file,
     PROJECT_ROOT,
 )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-ASSET_VERSION = "20260829g"
+ASSET_VERSION = "20260830k"
 
 app = FastAPI(title="CodeAgent", version="0.5.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 _run_lock = threading.Lock()
+_active_bridge: ApprovalBridge | None = None
+_bridge_lock = threading.Lock()
 
 
 class RunRequest(BaseModel):
     task: str = Field(..., min_length=1)
     workdir: str | None = "demos"
     model: str | None = None
-    max_steps: int | None = Field(default=20, ge=1, le=60)
+    max_steps: int | None = Field(default=30, ge=1, le=60)
     session_id: str | None = Field(
         default=None,
         description="Stable id for one conversation (= one history / memory unit).",
     )
+    ask_min_risk: Literal["low", "medium", "high"] = Field(
+        default="medium",
+        description="Risk level at which Web asks for Allow/Deny (default: medium+).",
+    )
+
+
+class ApproveRequest(BaseModel):
+    request_id: str = Field(..., min_length=4, max_length=64)
+    allowed: bool
+
+
+class WriteFileRequest(BaseModel):
+    workdir: str | None = "demos"
+    path: str = Field(..., min_length=1)
+    content: str = ""
+
+
+class DeleteFileRequest(BaseModel):
+    workdir: str | None = "demos"
+    path: str = Field(..., min_length=1)
 
 
 class WorkdirRequest(BaseModel):
@@ -70,6 +95,12 @@ def meta() -> dict[str, Any]:
         "default_workdir": str(demos if demos.is_dir() else PROJECT_ROOT),
         "project_root": str(PROJECT_ROOT),
         "asset_version": ASSET_VERSION,
+        "features": {
+            "fs_write": True,
+            "fs_delete": True,
+            "attach_drop": True,
+            "approval": True,
+        },
         "suggestions": [
             {
                 "title": "Create a script",
@@ -81,8 +112,8 @@ def meta() -> dict[str, Any]:
                 "desc": "Plan with todos, then repair",
                 "prompt": (
                     "阅读 greeter_test.py，修复 greeter.py 使测试全部通过。"
-                    "请先用 todo_write 列出计划，再逐步执行并更新 todo 状态，"
-                    "最后运行 python greeter_test.py 验证。"
+                    "用 todo_write 写 3～5 条阶段计划（可与读文件同轮），"
+                    "阶段完成再更新 todo；最后运行 python greeter_test.py 验证。"
                 ),
             },
             {
@@ -168,6 +199,38 @@ def fs_file(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/fs/write")
+def fs_write(body: WriteFileRequest) -> dict[str, Any]:
+    """Write a workdir file (diff Undo/Redo)."""
+    try:
+        wd = resolve_workdir(body.workdir or "demos")
+        if not wd.is_dir():
+            raise HTTPException(status_code=400, detail=f"workdir not found: {wd}")
+        return write_workdir_file(wd, body.path, body.content)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/fs/delete")
+def fs_delete(body: DeleteFileRequest) -> dict[str, Any]:
+    """Delete a workdir file (undo a newly created file)."""
+    try:
+        wd = resolve_workdir(body.workdir or "demos")
+        if not wd.is_dir():
+            raise HTTPException(status_code=400, detail=f"workdir not found: {wd}")
+        return delete_workdir_file(wd, body.path)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/fs/view")
 def fs_view(
     workdir: str = Query(default="demos"),
@@ -222,6 +285,19 @@ require(["vs/editor/editor.main"], function () {{
     return HTMLResponse(html)
 
 
+@app.post("/api/approve")
+def approve_tool(body: ApproveRequest) -> dict[str, Any]:
+    """Resolve a pending High/Medium tool approval from the Web UI."""
+    with _bridge_lock:
+        bridge = _active_bridge
+    if bridge is None:
+        raise HTTPException(status_code=409, detail="no active run awaiting approval")
+    result = bridge.resolve(body.request_id.strip(), body.allowed)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error") or "approve failed")
+    return result
+
+
 @app.post("/api/run")
 async def run_stream(body: RunRequest) -> StreamingResponse:
     task = body.task.strip()
@@ -244,11 +320,16 @@ async def run_stream(body: RunRequest) -> StreamingResponse:
     queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
     loop = asyncio.get_running_loop()
     session_id = body.session_id
+    ask_min_risk = body.ask_min_risk
 
     def emit(event: dict[str, Any]) -> None:
         loop.call_soon_threadsafe(queue.put_nowait, event)
 
     def worker() -> None:
+        global _active_bridge
+        bridge = ApprovalBridge(emit)
+        with _bridge_lock:
+            _active_bridge = bridge
         try:
             emit(
                 {
@@ -256,6 +337,8 @@ async def run_stream(body: RunRequest) -> StreamingResponse:
                     "task": task,
                     "workdir": str(wd_path),
                     "session_id": session_id,
+                    "approval": "ask",
+                    "ask_min_risk": ask_min_risk,
                 }
             )
 
@@ -270,11 +353,14 @@ async def run_stream(body: RunRequest) -> StreamingResponse:
                 workdir=wd_path,
                 model=body.model,
                 max_steps=body.max_steps,
-                approval="auto",
+                approval="ask",
                 save_run_transcript=True,
                 log=log,
                 on_event=on_event,
                 session_id=session_id,
+                ask_fn=bridge.ask,
+                ask_min_risk=ask_min_risk,
+                deny_high=False,
             )
             emit(
                 {
@@ -292,6 +378,10 @@ async def run_stream(body: RunRequest) -> StreamingResponse:
         except Exception as exc:  # noqa: BLE001
             emit({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
         finally:
+            bridge.close()
+            with _bridge_lock:
+                if _active_bridge is bridge:
+                    _active_bridge = None
             try:
                 _run_lock.release()
             except RuntimeError:

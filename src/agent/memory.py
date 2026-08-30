@@ -112,6 +112,87 @@ def load_working_memory(workdir: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def format_turn_summary(
+    *,
+    task: str,
+    final_text: str,
+    stopped_reason: str,
+    memory: dict[str, Any] | None = None,
+    usage: dict[str, Any] | None = None,
+) -> str:
+    """Rule-based turn summary for UI + MEMORY (no extra LLM call)."""
+    mem = memory or {}
+    task_line = " ".join((task or "").strip().split())
+    if len(task_line) > 160:
+        task_line = task_line[:157] + "…"
+    conclusion = " ".join((final_text or "").strip().split())
+    if len(conclusion) > 500:
+        conclusion = conclusion[:497] + "…"
+    files = list(mem.get("focus_files") or [])[:8]
+    related = list(mem.get("related_files") or [])[:6]
+    errors = list(mem.get("last_errors") or [])[:3]
+    todos = str(mem.get("todos_text") or "").strip()
+    history = str(mem.get("history_summary") or "").strip()
+
+    status_zh = {
+        "completed": "已完成",
+        "max_steps": "达到最大步数",
+        "interrupted": "已中断",
+        "loop_detected": "检测到循环",
+        "retry_exhausted": "重试耗尽",
+        "goal_met_forced": "目标已达成（强制收尾）",
+    }.get(stopped_reason, stopped_reason)
+
+    lines = [
+        "## 本轮总结",
+        f"- **任务：** {task_line or '（无）'}",
+        f"- **状态：** {status_zh}",
+    ]
+    if files:
+        lines.append("- **关键文件：** " + ", ".join(files))
+    if related:
+        lines.append("- **相关：** " + ", ".join(related))
+    if errors:
+        lines.append("- **错误 / 注意：**")
+        for e in errors:
+            lines.append(f"  - {e}")
+    if todos:
+        flat = todos.replace("\n", " | ")
+        if len(flat) > 280:
+            flat = flat[:277] + "…"
+        lines.append(f"- **待办：** {flat}")
+    if history:
+        hist_lines = [ln.strip() for ln in history.splitlines() if ln.strip()][:5]
+        if hist_lines:
+            lines.append("- **阶段备注：**")
+            for ln in hist_lines:
+                lines.append(f"  - {ln.lstrip('- ')}")
+    if conclusion:
+        lines.append(f"- **结论：** {conclusion}")
+    if usage:
+        lines.append(
+            f"- **上下文：** 剩余 {usage.get('remaining_pct')}% "
+            f"({usage.get('used_tokens')}/{usage.get('budget_tokens')} tok，"
+            f"level={usage.get('level')})"
+        )
+    lines.append(
+        "- **续写提示：** 后续任务可依赖 MEMORY.md / working_memory；"
+        "细节以磁盘文件为准，必要时 read_file。"
+    )
+    return "\n".join(lines).strip() + "\n"
+
+
+def save_turn_summary_file(workdir: Path, summary: str) -> Path | None:
+    """Write latest turn summary for demos / interview replay."""
+    try:
+        path = workdir.resolve() / ".agent" / "last_turn_summary.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(summary, encoding="utf-8")
+        return path
+    except OSError:
+        return None
+
+
 def append_run_to_memory(
     workdir: Path,
     *,
@@ -119,7 +200,8 @@ def append_run_to_memory(
     final_text: str,
     stopped_reason: str,
     memory: dict[str, Any] | None = None,
-    max_entry_chars: int = 1800,
+    max_entry_chars: int = 2200,
+    usage: dict[str, Any] | None = None,
 ) -> Path | None:
     """Append a rule-template entry (no LLM). Returns path written, or None on skip/error."""
     if stopped_reason == "interrupted":
@@ -127,47 +209,19 @@ def append_run_to_memory(
 
     path = resolve_memory_path(workdir)
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    mem = memory or {}
-
-    task_line = " ".join((task or "").strip().split())
-    if len(task_line) > 120:
-        task_line = task_line[:117] + "…"
-
-    files = list(mem.get("focus_files") or [])[:8]
-    errors = list(mem.get("last_errors") or [])[:3]
-    history = str(mem.get("history_summary") or "").strip()
-    todos = str(mem.get("todos_text") or "").strip()
-    summary = " ".join((final_text or "").strip().split())
-    if len(summary) > 400:
-        summary = summary[:397] + "…"
-
-    lines = [
-        f"## [{stamp}] {task_line or '(no task)'}",
-        f"- **Status:** {stopped_reason}",
-    ]
-    if files:
-        lines.append("- **Files:** " + ", ".join(files))
-    if errors:
-        lines.append("- **Pitfalls / errors:**")
-        for e in errors:
-            lines.append(f"  - {e}")
-    if summary:
-        lines.append(f"- **Conclusion:** {summary}")
-    if todos:
-        todo_flat = todos.replace("\n", " | ")
-        if len(todo_flat) > 280:
-            todo_flat = todo_flat[:277] + "…"
-        lines.append(f"- **Todos:** {todo_flat}")
-    if history:
-        hist_lines = [ln.strip() for ln in history.splitlines() if ln.strip()][:6]
-        if hist_lines:
-            lines.append("- **Phase / history notes:**")
-            for ln in hist_lines:
-                if not ln.startswith("-"):
-                    ln = "- " + ln
-                lines.append(f"  {ln}")
-
-    entry = "\n".join(lines).strip() + "\n"
+    entry_body = format_turn_summary(
+        task=task,
+        final_text=final_text,
+        stopped_reason=stopped_reason,
+        memory=memory,
+        usage=usage,
+    )
+    # MEMORY uses dated heading
+    entry = entry_body.replace(
+        "## Turn Summary",
+        f"## [{stamp}] Turn Summary",
+        1,
+    )
     if len(entry) > max_entry_chars:
         entry = entry[: max_entry_chars - 20] + "\n…(entry truncated)\n"
 

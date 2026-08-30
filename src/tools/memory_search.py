@@ -56,5 +56,7 @@ def register_memory_search_tools(
                 "required": ["query"],
             },
             handler=memory_search,
+            risk_level="low",
+            is_readonly=True,
         )
     )

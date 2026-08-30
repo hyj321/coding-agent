@@ -58,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--context-budget",
         type=int,
         default=None,
-        help="Approx token budget for Context Manager (default: CONTEXT_TOKEN_BUDGET or 8000).",
+        help="Approx token budget for Context Manager (default: CONTEXT_TOKEN_BUDGET or 32000).",
     )
     p.add_argument(
         "--transcript-dir",
@@ -94,7 +94,11 @@ def main(argv: list[str] | None = None) -> int:
         print("No task provided.", file=sys.stderr)
         return 2
 
-    gate = PermissionGate(config.workdir, approval=config.approval)
+    gate = PermissionGate(
+        config.workdir,
+        approval=config.approval,
+        deny_high=bool(getattr(config, "deny_high", False)),
+    )
     registry = build_default_registry(
         gate,
         max_output_chars=config.max_tool_output_chars,

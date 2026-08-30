@@ -8,11 +8,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from src.agent.context_manager import ContextManager, build_system_prompt
+from src.agent.context_manager import (
+    ContextManager,
+    build_system_prompt,
+    expand_tail_for_tool_pairing,
+    sanitize_tool_pairing,
+)
 
 __all__ = [
     "ContextManager",
     "build_system_prompt",
+    "expand_tail_for_tool_pairing",
+    "sanitize_tool_pairing",
     "trim_messages",
     "truncate_text",
 ]
@@ -34,7 +41,7 @@ def trim_messages(
     Does not mutate the caller's list. If already within budget, returns as-is.
     """
     if max_messages < 4 or len(messages) <= max_messages:
-        return messages
+        return sanitize_tool_pairing(messages)
 
     head = messages[:2]  # system + first user
     budget = max_messages - len(head)
@@ -42,20 +49,14 @@ def trim_messages(
         budget = 2
 
     tail = messages[-budget:]
-    while tail and tail[0].get("role") == "tool":
-        tail = tail[1:]
+    tail = expand_tail_for_tool_pairing(messages, tail, min_index=len(head))
 
     if not tail:
-        return list(messages[:max_messages])
+        return sanitize_tool_pairing(list(messages[:max_messages]))
 
-    start_idx = len(messages) - len(tail)
-    while start_idx > 2 and tail and tail[0].get("role") == "tool":
-        start_idx -= 1
-        tail = messages[start_idx:]
-
-    trimmed = head + tail
+    trimmed = head + list(tail)
     if len(trimmed) == len(messages):
-        return messages
+        return sanitize_tool_pairing(messages)
 
     notice = {
         "role": "user",
@@ -65,5 +66,5 @@ def trim_messages(
         ),
     }
     if len(trimmed) + 1 <= max_messages:
-        return head + [notice] + tail
-    return trimmed
+        return sanitize_tool_pairing(head + [notice] + list(tail))
+    return sanitize_tool_pairing(trimmed)

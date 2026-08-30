@@ -61,5 +61,7 @@ def register_rag_search_tools(
                 "required": ["query"],
             },
             handler=_rag_search,
+            risk_level="low",
+            is_readonly=True,
         )
     )

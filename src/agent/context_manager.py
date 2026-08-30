@@ -36,11 +36,46 @@ from src.agent.compress import (
     related_test_paths,
 )
 from src.agent.memory import format_memory_section, load_memory_excerpt
+from src.agent.retry_policy import RetryPolicy
+from src.agent.skills import format_skills_catalog
+from src.agent.task_state import TaskState
 from src.tools.filesystem import snapshot_workdir
 
 CONTEXT_NOTE_MARKER = "[Context Manager — layered working memory]"
 ROOT_REINJECT_MARKER = "[Root State — re-injected after context fold]"
 
+
+def context_usage_report(
+    *,
+    used_tokens: int,
+    budget_tokens: int,
+    fold_events: int = 0,
+    scope: str = "turn",
+) -> dict[str, Any]:
+    """Shared shape for SSE / UI: remaining capacity percentage."""
+    budget = max(1, int(budget_tokens))
+    used = max(0, int(used_tokens))
+    used_pct = min(100, int(round(100.0 * used / budget)))
+    remaining_pct = max(0, 100 - used_pct)
+    if remaining_pct <= 15:
+        level = "critical"
+        hint = "上下文将满：建议先让我总结关键结构/变量，或开 New task。"
+    elif remaining_pct <= 35:
+        level = "warn"
+        hint = "上下文偏紧：复杂任务可先总结再继续。"
+    else:
+        level = "ok"
+        hint = "上下文余量充足。"
+    return {
+        "scope": scope,
+        "used_tokens": used,
+        "budget_tokens": budget,
+        "used_pct": used_pct,
+        "remaining_pct": remaining_pct,
+        "level": level,
+        "folded": fold_events > 0,
+        "hint": hint,
+    }
 
 @dataclass
 class ActionRecord:
@@ -141,7 +176,7 @@ class ContextManager:
         *,
         workdir: Path,
         tool_names: list[str],
-        token_budget: int = 8000,
+        token_budget: int = 32000,
         recent_keep_messages: int = 16,
         observation_soft_chars: int = 1200,
         observation_hard_chars: int = 2400,
@@ -153,6 +188,9 @@ class ContextManager:
         self.observation_soft_chars = observation_soft_chars
         self.observation_hard_chars = observation_hard_chars
         self.state = ContextState()
+        self.task_state = TaskState()
+        self.retry_policy = RetryPolicy.from_env()
+        self.post_nudge_mutating: int = 0
         self._system_prompt_cache: str | None = None
         self._guideline = load_guideline(self.workdir)
         self.reload_project_memory()
@@ -191,6 +229,26 @@ class ContextManager:
                 )
             if restored:
                 self.state.actions = restored
+        ts_raw = snapshot.get("task_state")
+        if isinstance(ts_raw, dict):
+            self.task_state = TaskState.from_dict(ts_raw)
+            if not self.task_state.goal and self.state.task:
+                self.task_state.goal = self.state.task[:500]
+            # Keep relevant_files in sync with focus if empty
+            if not self.task_state.relevant_files and self.state.focus_files:
+                self.task_state.relevant_files = list(self.state.focus_files)[:8]
+        elif self.state.task and not self.task_state.goal:
+            self.task_state = TaskState.from_goal(self.state.task)
+        rp_raw = snapshot.get("retry_policy")
+        if isinstance(rp_raw, dict):
+            self.retry_policy = RetryPolicy.from_dict(rp_raw)
+            self._sync_task_retry_fields()
+        self.post_nudge_mutating = int(snapshot.get("post_nudge_mutating") or 0)
+
+    def _sync_task_retry_fields(self) -> None:
+        """Mirror RetryPolicy into TaskState for Current State / working_memory."""
+        self.task_state.failed = [s.to_dict() for s in self.retry_policy.by_key.values()]
+        self.task_state.retry_stage = int(self.retry_policy.last_stage or 0)
 
     def build_system_prompt(self) -> str:
         """Stable within a run — cached so prompt-prefix bytes do not churn each step."""
@@ -198,6 +256,8 @@ class ContextManager:
             return self._system_prompt_cache
         snapshot = snapshot_workdir(self.workdir)
         tools_line = ", ".join(self.tool_names)
+        skills_block = format_skills_catalog()
+        skills_section = f"\n{skills_block}\n" if skills_block else ""
         self._system_prompt_cache = f"""You are a coding agent running on the user's machine.
 You solve programming tasks by calling tools.
 
@@ -208,15 +268,29 @@ You solve programming tasks by calling tools.
 4. Prefer read_file / list_dir / glob before editing.
 5. Prefer edit_file for small edits; write_file for create/rewrite.
 6. Use run_shell for tests/scripts (non-interactive).
-7. Plan-then-Act: for non-trivial tasks, FIRST todo_write a checklist, keep one
-   item in_progress, update as you go; finish checklist before the final answer.
-8. When done, give a clear final answer and stop calling tools.
-9. On tool errors, adjust approach briefly and retry.
-10. Project Memory (MEMORY.md) may appear under Current State — treat it as
+7. Plan-then-Act (coarse): for non-trivial multi-step tasks, call todo_write with
+   3–5 phase-level items (e.g. locate → fix → verify)—NOT one todo per file or
+   per tool call. Keep at most one item in_progress. Update todo_write only at
+   phase boundaries (complete a phase, change plan, or finish)—not after every tool.
+   Trivial one-shot edits (single obvious file, no investigation) may skip todo_write.
+8. Batch tools in ONE assistant turn whenever independent: e.g. todo_write +
+   glob/read_file together; multiple read_file/glob calls together; load_skill
+   with the first reads. Never waste a turn on todo_write alone when you already
+   know what to read or edit next. Dependent calls stay sequential across turns
+   (e.g. run_shell then edit based on its output).
+9. When done, give a clear final answer and stop calling tools.
+10. Reply to the user in Simplified Chinese (简体中文) for FINAL answers,
+    summaries, and explanations unless they explicitly ask for another language.
+    Keep tool names, paths, and code in their original form.
+11. On tool errors, adjust approach briefly and retry—do not repeat the exact
+    same tool+arguments unchanged.
+12. Project Memory (MEMORY.md) may appear under Current State — treat it as
     durable cross-run notes (conventions / past pitfalls); do not ignore it.
-11. Use memory_search for keyword recall; rag_search for local TF–IDF semantic recall.
-12. Prompt layout: system+task are a stable prefix; working memory is a variable suffix.
-
+13. Use memory_search for keyword recall; rag_search for local TF–IDF semantic recall.
+14. Prompt layout: system+task are a stable prefix; working memory is a variable suffix.
+15. If an Available Skill matches the task, call load_skill(name) early (same turn
+    as first reads when possible), then follow it.
+{skills_section}
 ## Progressive Disclosure
 - Do NOT paste entire files into your reasoning.
 - Start from summaries / Current State / Historical Context below.
@@ -282,6 +356,23 @@ You solve programming tasks by calling tools.
             self.state.last_failed_tool = None
             self.state.last_failed_preview = ""
 
+        # Keep Task State in sync (goal / files / last_error / test_status)
+        self.task_state.update_from_tool(
+            tool_name=tool_name,
+            args=raw_args if isinstance(raw_args, dict) else None,
+            result=compressed,
+            paths=paths,
+        )
+        if self.state.focus_files and not self.task_state.relevant_files:
+            self.task_state.relevant_files = list(self.state.focus_files)[:8]
+        elif self.state.focus_files:
+            # Prefer focus order for relevant_files display
+            for p in reversed(list(self.state.focus_files)):
+                self.task_state.note_file(p)
+        if self.state.last_errors and not self.task_state.last_error:
+            self.task_state.last_error = self.state.last_errors[0]
+        elif self.state.last_errors:
+            self.task_state.last_error = self.state.last_errors[0]
         summary = compressed.replace("\n", " ")
         if len(summary) > 160:
             summary = summary[:157] + "…"
@@ -372,6 +463,7 @@ You solve programming tasks by calling tools.
     ) -> list[dict[str, Any]]:
         """Budget-aware copy: stable system prefix + variable working-memory suffix."""
         self.state.task = user_task or self.state.task
+        self.ensure_task_goal(user_task)
         prepared = [dict(m) for m in messages]
 
         # Stable prefix: cached system prompt (bytes fixed for this run)
@@ -403,9 +495,25 @@ You solve programming tasks by calling tools.
                 tokens = estimate_messages_tokens(prepared)
 
         if tokens <= self.token_budget:
-            return prepared
+            return sanitize_tool_pairing(prepared)
 
-        return self._fold_history(prepared, tokens)
+        return sanitize_tool_pairing(self._fold_history(prepared, tokens))
+
+    def usage_report(
+        self,
+        messages: list[dict[str, Any]] | None = None,
+        *,
+        scope: str = "turn",
+    ) -> dict[str, Any]:
+        """Estimate how full the context window is (chars≈tokens*4 heuristic)."""
+        msgs = messages if messages is not None else []
+        used = estimate_messages_tokens(msgs) if msgs else 0
+        return context_usage_report(
+            used_tokens=used,
+            budget_tokens=self.token_budget,
+            fold_events=self.state.fold_events,
+            scope=scope,
+        )
 
     def _strip_ephemeral_notes(
         self, messages: list[dict[str, Any]]
@@ -426,7 +534,7 @@ You solve programming tasks by calling tools.
     def _state_note(self, *, after_fold: bool = False) -> str:
         parts = [
             CONTEXT_NOTE_MARKER,
-            self.state.render_current_state(),
+            self._render_current_state_with_task(),
         ]
         hist = self.state.render_history()
         if hist:
@@ -444,6 +552,30 @@ You solve programming tasks by calling tools.
             f"guideline_updates: {self.state.guideline_updates})"
         )
         return "\n\n".join(parts)
+
+    def _render_current_state_with_task(self) -> str:
+        """Current State + Task State + failed strategies for prompt injection."""
+        self._sync_task_retry_fields()
+        base = self.state.render_current_state()
+        block = self.task_state.render_block()
+        extra = self.retry_policy.render_block()
+        parts: list[str] = []
+        if block:
+            parts.append(block)
+        elif extra:
+            parts.append(extra)
+        if not parts:
+            return base
+        lines = base.splitlines()
+        if lines and lines[0].startswith("## Current State"):
+            return "\n".join([lines[0], *parts, *lines[1:]])
+        return base + "\n" + "\n".join(parts)
+
+    def ensure_task_goal(self, user_task: str) -> None:
+        """Set goal once from the user task if not already present."""
+        self.state.task = user_task or self.state.task
+        if user_task and not self.task_state.goal:
+            self.task_state.goal = user_task.strip()[:500]
 
     def _root_state_block(self) -> str:
         """Force re-injection of MEMORY + focus + open todos after a fold."""
@@ -512,9 +644,11 @@ You solve programming tasks by calling tools.
         ]
         if len(bare) <= self.recent_keep_messages + 3:
             self._reinject_root_state()
-            return self._upsert_context_note(
-                self._shrink_tool_payloads(bare),
-                self._state_note(after_fold=True),
+            return sanitize_tool_pairing(
+                self._upsert_context_note(
+                    self._shrink_tool_payloads(bare),
+                    self._state_note(after_fold=True),
+                )
             )
 
         head: list[dict[str, Any]] = []
@@ -532,14 +666,7 @@ You solve programming tasks by calling tools.
 
         tail_budget = self.recent_keep_messages
         tail = bare[-tail_budget:]
-        while tail and tail[0].get("role") == "tool":
-            start = len(bare) - len(tail) - 1
-            if start < idx:
-                tail = tail[1:]
-                break
-            tail = bare[start:]
-            if tail[0].get("role") != "tool":
-                break
+        tail = expand_tail_for_tool_pairing(bare, tail, min_index=idx)
 
         mid_end = len(bare) - len(tail)
         middle = bare[idx:mid_end] if mid_end > idx else []
@@ -567,8 +694,10 @@ You solve programming tasks by calling tools.
             cleaned.append(m)
         cleaned.append({"role": "user", "content": self._state_note(after_fold=True)})
 
+        cleaned = sanitize_tool_pairing(cleaned)
         if estimate_messages_tokens(cleaned) > self.token_budget:
             cleaned = self._shrink_tool_payloads(cleaned)
+            cleaned = sanitize_tool_pairing(cleaned)
         return cleaned
 
     def _shrink_tool_payloads(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -657,6 +786,10 @@ You solve programming tasks by calling tools.
             "guideline_updates": self.state.guideline_updates,
             "layout_mode": self.state.layout_mode,
             "has_project_memory": bool(self.state.project_memory),
+            "task_state": self.task_state.to_dict(),
+            "retry_policy": self.retry_policy.to_dict(),
+            "post_nudge_mutating": self.post_nudge_mutating,
+            "stop_nudge_reasons": list(self.task_state.stop_nudge_reasons),
             "actions": [
                 {
                     "step": a.step,
@@ -732,6 +865,98 @@ def _phase_bullets(actions: list[ActionRecord], *, limit: int = 5) -> list[str]:
         if len(bullets) >= limit:
             break
     return bullets
+
+
+def sanitize_tool_pairing(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ensure every `tool` message follows an assistant with matching tool_calls.
+
+    Prevents API 400 when fold/trim/continue leaves orphan tool rows.
+    """
+    out: list[dict[str, Any]] = []
+    i = 0
+    n = len(messages)
+    while i < n:
+        m = messages[i]
+        role = m.get("role")
+
+        if role == "tool":
+            i += 1
+            continue
+
+        if role != "assistant":
+            out.append(m)
+            i += 1
+            continue
+
+        tool_calls = m.get("tool_calls") or []
+        if not tool_calls:
+            out.append(m)
+            i += 1
+            continue
+
+        expected: dict[str, dict[str, Any]] = {}
+        for tc in tool_calls:
+            tid = tc.get("id")
+            if tid:
+                expected[str(tid)] = tc
+
+        j = i + 1
+        tools: list[dict[str, Any]] = []
+        while j < n and messages[j].get("role") == "tool":
+            tools.append(messages[j])
+            j += 1
+
+        matched_tools = [
+            t
+            for t in tools
+            if t.get("tool_call_id") is not None
+            and str(t.get("tool_call_id")) in expected
+        ]
+        matched_ids = {str(t.get("tool_call_id")) for t in matched_tools}
+
+        if matched_tools and matched_ids == set(expected.keys()):
+            out.append(m)
+            out.extend(matched_tools)
+        elif matched_tools:
+            order = [str(tc.get("id")) for tc in tool_calls if tc.get("id")]
+            kept_calls = [expected[tid] for tid in order if tid in matched_ids]
+            adj = dict(m)
+            adj["tool_calls"] = kept_calls
+            out.append(adj)
+            id_order = {tid: k for k, tid in enumerate(order)}
+            matched_tools.sort(
+                key=lambda t: id_order.get(str(t.get("tool_call_id")), 999)
+            )
+            out.extend(matched_tools)
+        else:
+            adj = {k: v for k, v in m.items() if k != "tool_calls"}
+            if not adj.get("content"):
+                adj["content"] = "(tool calls omitted during context compaction)"
+            out.append(adj)
+
+        i = j
+
+    return out
+
+
+def expand_tail_for_tool_pairing(
+    messages: list[dict[str, Any]],
+    tail: list[dict[str, Any]],
+    *,
+    min_index: int = 0,
+) -> list[dict[str, Any]]:
+    """Grow or shrink `tail` so it does not start with an orphan `tool` message."""
+    if not tail:
+        return tail
+    while tail and tail[0].get("role") == "tool":
+        start = len(messages) - len(tail) - 1
+        if start < min_index:
+            tail = tail[1:]
+            continue
+        tail = messages[start:]
+        if tail[0].get("role") != "tool":
+            break
+    return sanitize_tool_pairing(list(tail)) if tail else tail
 
 
 # Back-compat re-export used by older imports

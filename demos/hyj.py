@@ -1,1 +1,1 @@
-print("Hello hyj")
+print("123456")

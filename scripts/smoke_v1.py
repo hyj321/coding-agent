@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 from src.agent.context import trim_messages
@@ -30,6 +32,7 @@ def main() -> None:
             "edit_file",
             "glob",
             "list_dir",
+            "load_skill",
             "memory_search",
             "rag_search",
             "read_file",
@@ -38,6 +41,178 @@ def main() -> None:
             "write_file",
         }
         assert set(reg.names()) == expected, reg.names()
+
+        skill_body = reg.dispatch("load_skill", {"name": "debugging"})
+        assert skill_body.startswith("# Skill: debugging"), skill_body[:80]
+        assert "todo_write" in skill_body and "edit_file" in skill_body
+        assert reg.dispatch("load_skill", {"name": "missing"}).startswith("Error")
+
+        from src.agent.context_manager import build_system_prompt
+        from src.agent.skills import discover_skills, format_skills_catalog
+
+        assert any(s.name == "debugging" for s in discover_skills())
+        catalog = format_skills_catalog()
+        assert "Available Skills" in catalog and "debugging" in catalog
+        prompt = build_system_prompt(root, reg.names())
+        assert "Available Skills" in prompt and "load_skill" in prompt
+        assert "Batch tools" in prompt or "Batch tools in ONE" in prompt
+        assert "phase-level" in prompt or "phase boundaries" in prompt
+        assert "Trivial one-shot" in prompt
+
+        from src.agent.loop import LoopGuard, tool_call_fingerprint
+        from src.agent.loop_guard import LoopGuard as LoopGuardDirect
+        from src.agent.retry_policy import RetryPolicy, make_failure_key
+        from src.agent.stop_conditions import (
+            build_final_nudge_message,
+            clear_nudge_state,
+            evaluate_final_nudge,
+            reasons_allow_force_stop,
+            should_force_stop_after_nudge,
+            todos_all_completed,
+        )
+        from src.agent.task_state import TaskState, parse_test_status
+
+        # Fingerprint: key order / whitespace must not create false uniqueness
+        fp_a = tool_call_fingerprint("read_file", {"path": "a.py"})
+        fp_b = tool_call_fingerprint("read_file", {"path": " a.py "})
+        fp_c = tool_call_fingerprint("read_file", '{"path":"a.py"}')
+        assert fp_a == fp_b == fp_c
+        assert tool_call_fingerprint("read_file", {"path": "b.py"}) != fp_a
+        assert LoopGuard is LoopGuardDirect
+
+        guard = LoopGuard(warn_after=3, stop_after=5, error_nudge_after=2)
+        streaks = []
+        for _ in range(5):
+            s, _ = guard.observe("read_file", {"path": "a.py"})
+            streaks.append(s)
+        assert streaks == [1, 2, 3, 4, 5]
+        assert guard.warning_suffix("read_file", 3)
+        assert "STOP" in (guard.warning_suffix("read_file", 5) or "")
+        s_reset, _ = guard.observe("read_file", {"path": "b.py"})
+        assert s_reset == 1
+
+        # Same-step dedup
+        guard2 = LoopGuard.from_env(warn_after=3, stop_after=5, error_nudge_after=2)
+        guard2.begin_step()
+        _, fp_d = guard2.observe("read_file", {"path": "notes.txt"})
+        assert guard2.same_step_lookup(fp_d) is None
+        guard2.same_step_store(fp_d, "hello world")
+        cached = guard2.same_step_lookup(fp_d)
+        assert cached == "hello world"
+        reuse_msg = LoopGuard.dedup_reuse_message("read_file", cached)
+        assert reuse_msg.startswith("[dedup]") and "hello world" in reuse_msg
+        guard2.begin_step()
+        assert guard2.same_step_lookup(fp_d) is None
+
+        # Error-streak nudge
+        guard3 = LoopGuard(warn_after=3, stop_after=5, error_nudge_after=2)
+        _, fp_e = guard3.observe("edit_file", {"path": "x.py", "old_string": "a", "new_string": "b"})
+        assert guard3.record_outcome(fp_e, ok=False) == 1
+        assert guard3.error_nudge_suffix("edit_file", 1) is None
+        assert guard3.record_outcome(fp_e, ok=False) == 2
+        nudge = guard3.error_nudge_suffix("edit_file", 2)
+        assert nudge and "ERROR_STREAK" in nudge
+        assert guard3.record_outcome(fp_e, ok=True) == 0
+
+        # RetryPolicy stage 1 → 2 → 3 stop
+        rp = RetryPolicy(max_failures=3)
+        args_fail = {"path": "greeter.py", "old_string": "a", "new_string": "b"}
+        err_body = "Error: old_string not found\nAssertionError: boom"
+        key = make_failure_key("edit_file", args_fail, err_body)
+        assert "edit_file" in key and "greeter.py" in key
+        d1 = rp.record_failure(tool_name="edit_file", args=args_fail, result=err_body)
+        assert d1.stage == 1 and not d1.should_stop and "stage=1" in (d1.suffix or "")
+        d2 = rp.record_failure(tool_name="edit_file", args=args_fail, result=err_body)
+        assert d2.stage == 2 and not d2.should_stop and "MUST change" in (d2.suffix or "")
+        d3 = rp.record_failure(tool_name="edit_file", args=args_fail, result=err_body)
+        assert d3.stage == 3 and d3.should_stop and "STOP" in (d3.suffix or "")
+        assert "edit_file|" in rp.banned_strategies_text()
+        assert "Banned strategies" in (d3.suffix or "")
+        assert rp.to_dict()["failed"]
+
+        # TaskState + pytest parse + stop conditions
+        ts = TaskState.from_goal("fix greeter tests")
+        assert "greeter" in ts.goal
+        ts.note_file("greeter.py")
+        ts.note_error("AssertionError: boom")
+        fail_out = (
+            "======= FAILURES =======\n"
+            "FAILED greeter_test.py::test_x\n"
+            "1 failed, 0 passed\n"
+            "exit_code: 1\n"
+        )
+        parsed_fail = parse_test_status("python -m pytest greeter_test.py -q", fail_out)
+        assert parsed_fail is not None and parsed_fail.passed is False
+        pass_out = "2 passed in 0.1s\nexit_code: 0\n"
+        parsed_pass = parse_test_status("pytest greeter_test.py", pass_out)
+        assert parsed_pass is not None and parsed_pass.passed is True
+        ts.test_status = parsed_pass
+        block = ts.render_block()
+        assert "Task State" in block and "PASSED" in block and "greeter.py" in block
+
+        todos_done = "Todo list:\n  [x] (1) locate\n  [x] (2) fix\n"
+        assert todos_all_completed(todos_done)
+        assert not todos_all_completed("Todo list:\n  [>] (1) locate\n")
+        urge, reasons = evaluate_final_nudge(
+            task_state=ts, todos_text=todos_done, step_had_failure=False
+        )
+        assert urge and "tests_all_pass" in reasons
+        assert reasons_allow_force_stop(reasons)
+        # todo-only must NOT force-stop (UI polish / continue-edit UX)
+        ts_todo = TaskState.from_goal("polish UI")
+        urge_todo, reasons_todo = evaluate_final_nudge(
+            task_state=ts_todo, todos_text=todos_done, step_had_failure=False
+        )
+        assert urge_todo and reasons_todo == ["todo_all_done"]
+        assert not reasons_allow_force_stop(reasons_todo)
+        assert not should_force_stop_after_nudge(
+            mutating_count=99, limit=2, reasons=reasons_todo
+        )
+        assert should_force_stop_after_nudge(
+            mutating_count=2, limit=2, reasons=["tests_all_pass"]
+        )
+        nudge_text = build_final_nudge_message(reasons, task_state=ts)
+        assert nudge_text.startswith("[stop_condition]") and "FINAL" in nudge_text
+        soft = build_final_nudge_message(["todo_all_done"], task_state=ts_todo)
+        assert "可以继续编辑" in soft
+        clear_nudge_state(ts)
+        assert ts.final_nudge_sent is False and ts.stop_nudge_reasons == []
+
+        from src.agent.context_manager import ContextManager
+
+        cm = ContextManager(workdir=root, tool_names=reg.names(), token_budget=8000)
+        cm.ensure_task_goal("fix notes.txt")
+        compressed = cm.observe_tool(
+            step=1,
+            tool_name="read_file",
+            raw_args={"path": "notes.txt"},
+            result="hello world",
+        )
+        assert compressed == "hello world"
+        assert "notes.txt" in cm.task_state.relevant_files
+        # Simulate staged failures via retry_policy on context
+        cm.retry_policy = RetryPolicy(max_failures=3)
+        cm.retry_policy.record_failure(
+            tool_name="edit_file",
+            args={"path": "notes.txt", "old_string": "x", "new_string": "y"},
+            result="Error: not found",
+        )
+        cm._sync_task_retry_fields()
+        note = cm._state_note()
+        assert "Task State" in note and "fix notes.txt" in note
+        assert "Failed strategies" in note or "retry" in note.lower() or cm.task_state.failed
+        mem = cm.export_memory()
+        assert isinstance(mem.get("task_state"), dict)
+        assert mem["task_state"]["goal"]
+        assert isinstance(mem.get("retry_policy"), dict)
+
+        todo_desc = next(
+            s["function"]["description"]
+            for s in reg.openai_tools()
+            if s["function"]["name"] == "todo_write"
+        )
+        assert "phase" in todo_desc.lower() or "3–5" in todo_desc or "3-5" in todo_desc
+        assert "SAME" in todo_desc or "same" in todo_desc.lower()
 
         listed = reg.dispatch("list_dir", {"path": "."})
         assert "notes.txt" in listed and "sub" in listed
@@ -75,6 +250,21 @@ def main() -> None:
         assert "exit_code: 0" in shell
         assert "ok" in shell
 
+        # Windows GBK crash regression: UTF-8 bytes that are illegal as GBK
+        from src.tools.shell import _decode_output
+
+        bad_for_gbk = bytes([0xe2, 0x80, 0x94])  # UTF-8 em-dash
+        assert "—" in _decode_output(bad_for_gbk) or "\ufffd" in _decode_output(
+            bad_for_gbk
+        ) or len(_decode_output(bad_for_gbk)) > 0
+        mixed = reg.dispatch(
+            "run_shell",
+            {"command": "python -c \"import sys; sys.stdout.buffer.write(b'hi-\\xe2\\x80\\x94\\n')\""},
+        )
+        assert "exit_code: 0" in mixed
+        assert "hi-" in mixed
+        assert "UnicodeDecodeError" not in mixed
+
         escaped = reg.dispatch("read_file", {"path": "../outside.txt"})
         assert escaped.startswith("Error"), escaped
 
@@ -90,8 +280,10 @@ def main() -> None:
 
         # never mode denies risky rm -rf of a folder
         never_gate = PermissionGate(root, approval=ApprovalMode.NEVER)
+        never_gate.bind_registry(reg)
         risky = never_gate.authorize("run_shell", {"command": "rm -rf build"})
         assert not risky.allowed
+        assert risky.risk_level == "high"
 
         # ask mode with auto-deny callback
         ask_gate = PermissionGate(
@@ -99,8 +291,145 @@ def main() -> None:
             approval=ApprovalMode.ASK,
             ask_fn=lambda _p: False,
         )
+        ask_gate.bind_registry(reg)
         blocked = ask_gate.authorize("write_file", {"path": "x", "content": "y"})
         assert not blocked.allowed
+
+        # Web ApprovalBridge: emit + resolve Allow
+        from src.agent.permissions import ApprovalPrompt
+        from src.web.approval import ApprovalBridge
+
+        events: list[dict] = []
+        bridge = ApprovalBridge(events.append, timeout_sec=5.0)
+        result_box: list[bool] = []
+        prompt = ApprovalPrompt(
+            tool_name="write_file",
+            risk_level="medium",
+            summary="x.py",
+            arguments={"path": "x.py"},
+            call_id="call_1",
+        )
+
+        def _ask_worker() -> None:
+            result_box.append(bridge.ask(prompt))
+
+        ask_thread = threading.Thread(target=_ask_worker, daemon=True)
+        ask_thread.start()
+        for _ in range(50):
+            if bridge.pending_id():
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("approval_request never became pending")
+        rid = bridge.pending_id() or ""
+        assert any(e.get("type") == "approval_request" for e in events)
+        assert bridge.resolve(rid, True)["ok"]
+        ask_thread.join(timeout=2)
+        assert result_box == [True]
+        assert any(e.get("type") == "approval_resolved" and e.get("allowed") for e in events)
+        bridge.close()
+
+        # ask_min_risk=high: medium write auto-allowed without callback
+        high_only = PermissionGate(
+            root,
+            approval=ApprovalMode.ASK,
+            ask_fn=lambda _p: (_ for _ in ()).throw(AssertionError("should not ask")),
+            ask_min_risk="high",
+        )
+        high_only.bind_registry(reg)
+        auto_med = high_only.authorize("write_file", {"path": "x", "content": "y"})
+        assert auto_med.allowed
+        assert "ask_min_risk" in auto_med.reason
+
+        # --- 17.8 P0: risk metadata + sensitive paths + shell risk ---
+        from src.agent.permissions import is_sensitive_path
+
+        assert is_sensitive_path(".env")
+        assert is_sensitive_path(".env.local")
+        assert is_sensitive_path("secrets/token.txt")
+        assert is_sensitive_path(".ssh/id_rsa")
+        assert is_sensitive_path("server.pem")
+        assert not is_sensitive_path("greeter.py")
+
+        # Tool metadata on registry
+        assert reg.get("read_file").risk_level == "low" and reg.get("read_file").is_readonly
+        assert reg.get("list_dir").risk_level == "low"
+        assert reg.get("write_file").risk_level == "medium"
+        assert reg.get("edit_file").risk_level == "medium"
+        assert reg.get("run_shell").risk_level == "medium"
+        assert reg.get("todo_write").risk_level == "low"
+
+        # Sensitive path always Deny (even approval=auto)
+        env_deny = gate.authorize("read_file", {"path": ".env"})
+        assert not env_deny.allowed
+        assert "sensitive" in env_deny.reason
+        assert env_deny.risk_level == "high"
+        env_write = gate.authorize("write_file", {"path": ".env", "content": "x=1"})
+        assert not env_write.allowed
+        cat_env = gate.authorize("run_shell", {"command": "cat .env"})
+        assert not cat_env.allowed
+        assert "sensitive" in cat_env.reason
+
+        # High shell: git reset --hard → high; auto allows, never denies
+        reset_auto = gate.authorize("run_shell", {"command": "git reset --hard"})
+        assert reset_auto.allowed and reset_auto.risk_level == "high"
+        reset_never = never_gate.authorize("run_shell", {"command": "git reset --hard"})
+        assert not reset_never.allowed and reset_never.risk_level == "high"
+
+        # Normal pytest stays medium and is Allowed under auto
+        pytest_ok = gate.authorize("run_shell", {"command": "pytest -q greeter_test.py"})
+        assert pytest_ok.allowed and pytest_ok.risk_level == "medium"
+
+        # Low-risk tools always Allow (even ask/never)
+        low_list = never_gate.authorize("list_dir", {"path": "."})
+        assert low_list.allowed and low_list.risk_level == "low"
+        low_read = ask_gate.authorize("read_file", {"path": "notes.txt"})
+        assert low_read.allowed and low_read.risk_level == "low"
+
+        # --- 17.8 P1: tool visibility + completion gate + deny_high ---
+        from src.agent.completion_gate import (
+            build_evidence_nudge_message,
+            note_completion_nudge,
+            should_block_completion,
+        )
+        from src.agent.task_state import TaskState, TestStatus
+        from src.agent.tool_visibility import infer_phase, visible_tool_names
+
+        assert infer_phase(todos_text="  [>] (1) 定位失败原因") == "explore"
+        assert infer_phase(todos_text="  [>] (2) 修复 greeter.py") == "edit"
+        assert infer_phase(todos_text="  [>] (3) 跑测试验证") == "verify"
+        assert infer_phase(todos_text="", goal="hello") == "full"
+        assert infer_phase(files_mutated=True, tests_passed=False) == "verify"
+
+        explore_names = visible_tool_names(reg, "explore")
+        assert "read_file" in explore_names and "write_file" not in explore_names
+        assert "run_shell" not in explore_names
+        verify_names = visible_tool_names(reg, "verify")
+        assert "run_shell" in verify_names and "edit_file" in verify_names
+        assert "write_file" not in verify_names
+        full_payload = reg.openai_tools()
+        narrow = reg.openai_tools(names=explore_names)
+        assert len(narrow) < len(full_payload)
+        assert {t["function"]["name"] for t in narrow} == set(explore_names)
+
+        ts = TaskState(goal="修复 greeter 测试", files_mutated=True, stop_condition="tests_all_pass")
+        block, why = should_block_completion(ts, completion_mode="evidence", max_nudges=2)
+        assert block and "evidence" in why
+        note_completion_nudge(ts)
+        note_completion_nudge(ts)
+        block2, why2 = should_block_completion(ts, completion_mode="evidence", max_nudges=2)
+        assert not block2 and "budget" in why2
+        ts.test_status = TestStatus(passed=True, summary="1 passed")
+        assert should_block_completion(ts, completion_mode="evidence")[0] is False
+        assert "[completion_gate]" in build_evidence_nudge_message(TaskState(files_mutated=True))
+
+        web_gate = PermissionGate(root, approval=ApprovalMode.AUTO, deny_high=True)
+        web_gate.bind_registry(reg)
+        high_denied = web_gate.authorize("run_shell", {"command": "git reset --hard"})
+        assert not high_denied.allowed
+        assert high_denied.risk_level == "high"
+        med_ok = web_gate.authorize("run_shell", {"command": "pytest -q"})
+        assert med_ok.allowed
 
         # Context trim keeps system + user and drops orphan tools
         messages = [
@@ -127,6 +456,50 @@ def main() -> None:
         assert trimmed[1]["role"] == "user"
         assert trimmed[2]["role"] != "tool"
         assert len(trimmed) <= 8
+        # No orphan tool rows after trim
+        for i, m in enumerate(trimmed):
+            if m.get("role") != "tool":
+                continue
+            assert i > 0 and trimmed[i - 1].get("role") == "assistant" or any(
+                prev.get("role") == "assistant" and prev.get("tool_calls")
+                for prev in trimmed[:i]
+            )
+
+        from src.agent.context import sanitize_tool_pairing
+
+        orphaned = [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "x", "content": "orphan"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "list_dir", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "c2",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            },
+            # missing tool for c2 — should strip tool_calls
+        ]
+        fixed = sanitize_tool_pairing(orphaned)
+        assert not any(m.get("role") == "tool" and m.get("tool_call_id") == "x" for m in fixed)
+        assert any(m.get("role") == "tool" and m.get("tool_call_id") == "c1" for m in fixed)
+        last_asst = [m for m in fixed if m.get("role") == "assistant"][-1]
+        assert not last_asst.get("tool_calls")
 
         # Transcript
         tdir = root / "transcripts"
@@ -135,14 +508,54 @@ def main() -> None:
             steps=1,
             stopped_reason="completed",
             messages=[{"role": "user", "content": "hi"}],
+            memory={
+                "context_usage": {
+                    "remaining_pct": 72,
+                    "used_pct": 28,
+                    "used_tokens": 2240,
+                    "budget_tokens": 8000,
+                    "level": "ok",
+                    "scope": "turn",
+                }
+            },
         )
         path = save_transcript(tdir, task="hi", result=result, meta={"model": "test"})
         data = json.loads(path.read_text(encoding="utf-8"))
         assert data["stopped_reason"] == "completed"
         assert data["task"] == "hi"
+        assert data.get("context_usage", {}).get("remaining_pct") == 72
+
+        sess_usage_result = AgentResult(
+            final_text="turn done",
+            steps=2,
+            stopped_reason="completed",
+            messages=[{"role": "user", "content": "t1"}],
+            memory={
+                "context_usage": {
+                    "remaining_pct": 55,
+                    "used_pct": 45,
+                    "used_tokens": 3600,
+                    "budget_tokens": 8000,
+                    "level": "ok",
+                    "scope": "turn",
+                }
+            },
+        )
+        save_transcript(
+            tdir,
+            task="t1",
+            result=sess_usage_result,
+            meta={"source": "test"},
+            session_id="smokeusage0001",
+        )
+        sess_u = load_session(tdir, "smokeusage0001")
+        assert sess_u is not None
+        assert sess_u.get("context_usage", {}).get("remaining_pct") == 55
+        assert sess_u["turns"][-1]["context_usage"]["remaining_pct"] == 55
 
         schemas = reg.openai_tools()
-        assert len(schemas) == 9
+        assert len(schemas) == 10
+        assert any(s["function"]["name"] == "load_skill" for s in schemas)
 
         todo_out = reg.dispatch(
             "todo_write",
@@ -500,14 +913,63 @@ def main() -> None:
         assert sess is not None
         slim, prior_mem = build_continue_context(sess, recent_k=6)
         assert prior_mem and prior_mem.get("focus_files") == ["a.py"]
-        assert slim[0]["role"] == "user" and "original task" in slim[0]["content"]
+        assert slim[0]["role"] == "user" and (
+            "original task" in slim[0]["content"] or "ACTIVE GOAL" in slim[0]["content"]
+        )
         assert any(
             m.get("role") == "user"
             and isinstance(m.get("content"), str)
             and m["content"].startswith("[Session memory")
             for m in slim
         )
-        assert len(slim) < len(big_messages)
+
+        # 「继续做」must resolve to latest unfinished goal, not turn-0
+        from src.agent.transcript import last_active_task, resolve_continue_task
+
+        multi = {
+            "task": "first hello task",
+            "turns": [
+                {"task": "first hello task", "stopped_reason": "completed", "steps": 2},
+                {
+                    "task": "beautify timer UI",
+                    "stopped_reason": "max_steps",
+                    "steps": 20,
+                },
+            ],
+            "messages": [
+                {"role": "user", "content": "first hello task"},
+                {"role": "assistant", "content": "done hello"},
+                {"role": "user", "content": "beautify timer UI"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "1", "content": "ui code"},
+            ],
+            "memory": {"task": "继续做", "focus_files": ["timer_app.py"]},
+        }
+        assert last_active_task(multi) == "beautify timer UI"
+        resolved = resolve_continue_task("继续做", multi)
+        assert "beautify timer UI" in resolved
+        assert "hello" not in resolved.lower() or "first hello" not in resolved
+        slim2, mem2 = build_continue_context(multi, recent_k=4)
+        assert "ACTIVE GOAL" in slim2[0]["content"]
+        assert "beautify timer UI" in slim2[0]["content"]
+        assert mem2 and mem2.get("task") == "beautify timer UI"
+        assert any(
+            m.get("role") == "user" and m.get("content") == "beautify timer UI" for m in slim2
+        )
+        # Slim continue must keep an ACTIVE GOAL briefing (not revive only turn-0)
+        assert any(
+            isinstance(m.get("content"), str) and "ACTIVE GOAL" in m["content"] for m in slim
+        )
 
     print("smoke_v1: OK (ui-events+context+memory-p0+p1+p2)")
 

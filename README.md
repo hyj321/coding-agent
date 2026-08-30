@@ -8,13 +8,21 @@
 
 ## 特色（Day3）
 
-**Plan-then-Act（`todo_write`）**：非平凡任务先写检查清单，保持最多一项 `in_progress`，边做边更新，降低跑偏；过程在终端与 transcript 中可见，便于演示与答辩。
+**Plan-then-Act（`todo_write`）**：非平凡任务用 3～5 条**阶段**清单（可与读文件同轮），最多一项 `in_progress`，阶段边界再更新；平凡单改可跳过。过程在终端与 transcript 中可见。
+
+**Skills（轻量）**：`skills/*/SKILL.md` 提供一类任务的可复用方法；system 只注入 name+description（L1），命中后用 `load_skill` 加载正文（L2）。已内置 `debugging`。
+
+**上下文容量条**：输入框下方显示剩余容量%；将满时提示先总结。每轮结束自动写入 `MEMORY.md` / `.agent/last_turn_summary.md` 并在界面展示摘要。
 
 ## 功能一览
 
 - Agent 主循环 + `max_steps` / 用户中断
-- 工具：`read_file` / `write_file` / `edit_file` / `list_dir` / `glob` / `run_shell` / `todo_write` / `memory_search` / `rag_search`
+- 工具：`read_file` / `write_file` / `edit_file` / `list_dir` / `glob` / `run_shell` / `todo_write` / `load_skill` / `memory_search` / `rag_search`
+- Skills：渐进披露（目录常驻 + `load_skill` 按需加载），见 `skills/debugging/`
 - 路径沙箱 + `--approval auto|ask|never`
+- **三级风险元数据**（`risk_level` / `is_readonly`）：Low 自动放行；Medium/High 受 approval 约束；`.env` / SSH Key 等敏感路径 **始终 Deny**
+- **Least Privilege 可见集**（`TOOL_VISIBILITY=auto`）：按 todo 阶段收窄本步工具；**Completion Evidence**：改文件后无测试绿不准宣称完成
+- Web 默认 **High Deny**（无确认框时不放行高危 shell）
 - 上下文裁剪（`MAX_MESSAGES`）+ 工具输出截断
 - **ACON 简化版 Context Manager**：分层上下文 + pytest 等观测压缩 + 超预算历史摘要折叠（`CONTEXT_TOKEN_BUDGET`）
 - **长短期记忆（P0–P2）**：MEMORY.md、working_memory、续写瘦身、前缀/后缀布局、折叠重注、MicroCompact、失败对更新压缩 guideline、本地 TF–IDF `rag_search`、prompt-cache 钩子
@@ -32,7 +40,7 @@ copy .env.example .env
 # 编辑 .env，填入 DEEPSEEK_API_KEY
 
 python -m scripts.smoke_v1
-python -m src.main -w demos --approval auto "阅读 greeter_test.py，修复 greeter.py 使测试通过。先用 todo_write 规划，再执行，最后运行 python greeter_test.py。"
+python -m src.main -w demos --approval auto "阅读 greeter_test.py，修复 greeter.py 使测试通过。用粗粒度 todo（可与读文件同轮），最后运行 python greeter_test.py。"
 ```
 
 演示说明见 [`demos/DEMO.md`](demos/DEMO.md)。
@@ -76,8 +84,8 @@ Agent Loop (src/agent/loop.py)
    ↓
 ┌──────────────┬─────────────────┬──────────────────┐
 │ LLM Client   │ Tool Registry   │ Permissions      │
-│ DeepSeek     │ schema+handler  │ 沙箱 + approval  │
-│ OpenAI 兼容  │ 本地执行        │ hard-deny 危险命令│
+│ DeepSeek     │ schema+handler  │ 沙箱 + 三级风险  │
+│ OpenAI 兼容  │ risk_level 元数据│ Allow/Confirm/Deny│
 └──────────────┴─────────────────┴──────────────────┘
          Context: Context Manager + MEMORY.md + 历史折叠
          Transcript: session / run JSON（含 memory 快照）
@@ -88,6 +96,8 @@ Agent Loop (src/agent/loop.py)
 1. **模型只出意图，副作用在本地**——工具结果必须写回 messages，模型才能感知。
 2. **新工具 = 注册表加一项**，主循环不必改。
 3. **Todo 是一等工具**，不是另起一套框架；规划与执行仍在同一 loop 里。
+4. **安全在工具边界执行**：`PermissionGate` 读 Registry 元数据 + 参数启发式（敏感路径 / 危险 shell），不依赖模型「保证遵守」。
+5. **完成靠证据**：Harness 用 pytest / exit code 决定能否 Terminate；模型自述「已修好」不够。
 
 ## 环境变量 / CLI
 
@@ -96,9 +106,12 @@ Agent Loop (src/agent/loop.py)
 | `DEEPSEEK_API_KEY` | 必填 |
 | `BASE_URL` / `MODEL` | 默认 DeepSeek flash |
 | `-w` | 工作目录沙箱 |
-| `--approval` | `auto` / `ask` / `never` |
+| `--approval` | `auto` / `ask` / `never`（Low 始终放行；Medium/High 受此约束；敏感路径与 hard-deny 始终拒绝） |
+| `TOOL_VISIBILITY` | `auto`（按阶段收窄工具）/ `off`（全量） |
+| `COMPLETION_MODE` | `evidence`（默认，改代码需测试证据）/ `trust_model` |
+| `DENY_HIGH` | `true` 时 High 在 auto 下也拒绝（Web 默认开启） |
 | `--max-steps` / `--max-messages` | 循环与上下文上限 |
-| `--context-budget` / `CONTEXT_TOKEN_BUDGET` | Context Manager 近似 token 预算（默认 8000） |
+| `--context-budget` / `CONTEXT_TOKEN_BUDGET` | Context Manager 近似 token 预算（默认 **32000**） |
 | `--transcript-dir` | 默认 `transcripts`；`off` 关闭 |
 
 进度与计划见 `计划书.md`。

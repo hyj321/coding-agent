@@ -12,7 +12,12 @@ const historySearch = document.getElementById("historySearch");
 const todoList = document.getElementById("todoList");
 const todoEmpty = document.getElementById("todoEmpty");
 const runStatus = document.getElementById("runStatus");
+const contextRing = document.getElementById("contextRing");
+const contextRingArc = document.getElementById("contextRingArc");
+const contextRingDetail = document.getElementById("contextRingDetail");
+const attachChips = document.getElementById("attachChips");
 const workspace = document.querySelector(".workspace");
+const composerWrap = document.querySelector(".composer-wrap");
 const fileTree = document.getElementById("fileTree");
 const filesWorkdir = document.getElementById("filesWorkdir");
 const filesPane = document.getElementById("filesPane");
@@ -28,8 +33,19 @@ const codeTabName = document.getElementById("codeTabName");
 const codeModeBadge = document.getElementById("codeModeBadge");
 const codeLangLabel = document.getElementById("codeLangLabel");
 const monacoHost = document.getElementById("monacoHost");
+const diffActions = document.getElementById("diffActions");
+const btnDiffUndo = document.getElementById("btnDiffUndo");
+const btnDiffRedo = document.getElementById("btnDiffRedo");
+const approvalBar = document.getElementById("approvalBar");
+const approvalRisk = document.getElementById("approvalRisk");
+const approvalTool = document.getElementById("approvalTool");
+const approvalSummary = document.getElementById("approvalSummary");
+const btnApprovalAllow = document.getElementById("btnApprovalAllow");
+const btnApprovalDeny = document.getElementById("btnApprovalDeny");
 
 let running = false;
+let pendingApprovalId = null;
+let pendingApprovalCallId = null;
 let historyCache = [];
 let stepCards = new Map();
 let activeStep = null;
@@ -41,10 +57,14 @@ let stepKeyBase = 0;
 /** path -> { path, old_content, new_content, is_new, tool } */
 let changedFiles = new Map();
 let projectRoot = "";
+/** path -> { path, kind: "file"|"dir" } — dragged into composer */
+let attachedPaths = new Map();
 let monacoReady = null;
 let monacoEditor = null;
 let monacoDiff = null;
 let monacoMode = null; // "code" | "diff"
+/** Active diff for Undo/Redo: { path, old_content, new_content, is_new, applied: "modified"|"original" } */
+let activeDiff = null;
 
 const ICONS = ["🌐", "📈", "📄"];
 
@@ -53,9 +73,194 @@ function newSessionId() {
   return `s${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
 }
 
+/** Circumference of r=14 ring: 2πr */
+const CONTEXT_RING_LEN = 87.96;
+let contextRingOpen = false;
+let lastContextUsage = null;
+
 function setStatus(mode, text) {
   runStatus.className = `run-status ${mode}`;
   runStatus.textContent = text;
+}
+
+function hideApprovalBar() {
+  pendingApprovalId = null;
+  pendingApprovalCallId = null;
+  if (approvalBar) approvalBar.classList.add("hidden");
+  if (btnApprovalAllow) btnApprovalAllow.disabled = false;
+  if (btnApprovalDeny) btnApprovalDeny.disabled = false;
+}
+
+function markToolAwaiting(callId, awaiting) {
+  if (!callId || activeStep == null) return;
+  const card = stepCards.get(activeStep);
+  if (!card) return;
+  const block = findToolBlock(card, callId);
+  if (!block) return;
+  block.classList.toggle("awaiting", !!awaiting);
+  const status = block.querySelector(".tool-status");
+  if (status && awaiting) status.textContent = "等待授权…";
+}
+
+function showApprovalRequest(data) {
+  pendingApprovalId = data.request_id;
+  pendingApprovalCallId = data.call_id || null;
+  const risk = (data.risk_level || "medium").toLowerCase();
+  if (approvalRisk) approvalRisk.textContent = risk;
+  if (approvalTool) approvalTool.textContent = data.tool_name || "tool";
+  if (approvalSummary) approvalSummary.textContent = data.summary || "";
+  if (approvalBar) {
+    approvalBar.classList.toggle("is-high", risk === "high");
+    approvalBar.classList.remove("hidden");
+  }
+  if (btnApprovalAllow) btnApprovalAllow.disabled = false;
+  if (btnApprovalDeny) btnApprovalDeny.disabled = false;
+  markToolAwaiting(pendingApprovalCallId, true);
+  setStatus("running", "等待授权…");
+  approvalBar?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+async function respondApproval(allowed) {
+  if (!pendingApprovalId || !running) return;
+  const requestId = pendingApprovalId;
+  if (btnApprovalAllow) btnApprovalAllow.disabled = true;
+  if (btnApprovalDeny) btnApprovalDeny.disabled = true;
+  try {
+    const res = await fetch("/api/approve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request_id: requestId, allowed: !!allowed }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || res.status);
+    setStatus("running", allowed ? "已允许，继续执行…" : "已拒绝，继续执行…");
+  } catch (err) {
+    addInfoBubble(`授权失败：${err}`);
+    if (btnApprovalAllow) btnApprovalAllow.disabled = false;
+    if (btnApprovalDeny) btnApprovalDeny.disabled = false;
+  }
+}
+
+function formatContextDetail(data) {
+  if (!data) return "—%";
+  const remaining = Math.max(0, Math.min(100, Number(data.remaining_pct)));
+  const scope = data.scope === "session" ? "会话" : "本轮";
+  if (data.used_tokens != null && data.budget_tokens != null) {
+    return `剩余 ${remaining}% · ${data.used_tokens}/${data.budget_tokens} tok · ${scope}`;
+  }
+  return `剩余 ${remaining}% · ${scope}`;
+}
+
+function updateContextMeter(data) {
+  if (!contextRing || !data) return;
+  lastContextUsage = data;
+  const remaining = Math.max(0, Math.min(100, Number(data.remaining_pct)));
+  const used = Math.max(0, Math.min(100, Number(data.used_pct ?? 100 - remaining)));
+  const level = data.level || (remaining <= 15 ? "critical" : remaining <= 35 ? "warn" : "ok");
+  contextRing.dataset.level = level;
+  // Ring fill = used portion (fills up as context is consumed)
+  if (contextRingArc) {
+    const offset = CONTEXT_RING_LEN * (1 - used / 100);
+    contextRingArc.style.strokeDashoffset = String(offset);
+  }
+  if (contextRingDetail) {
+    contextRingDetail.textContent = formatContextDetail(data);
+  }
+  const hint = data.hint || "Approximate context capacity";
+  contextRing.title = contextRingOpen
+    ? hint
+    : `上下文剩余 ${Number.isFinite(remaining) ? remaining : "—"}%（点击查看明细）`;
+  contextRing.setAttribute("aria-label", `上下文剩余 ${remaining}%`);
+}
+
+function resetContextMeter() {
+  lastContextUsage = null;
+  updateContextMeter({
+    remaining_pct: 100,
+    used_pct: 0,
+    level: "ok",
+    scope: "turn",
+    hint: "发送任务后显示用量",
+    used_tokens: 0,
+    budget_tokens: null,
+  });
+  if (contextRingDetail) contextRingDetail.textContent = "—%";
+  if (contextRing) {
+    contextRing.title = "发送任务后显示用量";
+    contextRing.setAttribute("aria-label", "上下文用量");
+  }
+}
+
+/** Restore ring from a saved turn / session payload (or estimate from messages). */
+function applyStoredContextUsage(data) {
+  if (!data) {
+    resetContextMeter();
+    return;
+  }
+  const turns = data.turns || [];
+  let usage = null;
+  if (turns.length) {
+    for (let i = turns.length - 1; i >= 0; i--) {
+      const cu = turns[i]?.context_usage;
+      if (cu && typeof cu === "object" && cu.remaining_pct != null) {
+        usage = cu;
+        break;
+      }
+    }
+  }
+  if (!usage && data.context_usage && typeof data.context_usage === "object") {
+    usage = data.context_usage;
+  }
+  if (!usage && data.memory && typeof data.memory === "object") {
+    const cu = data.memory.context_usage;
+    if (cu && typeof cu === "object") usage = cu;
+  }
+  if (!usage && Array.isArray(data.messages) && data.messages.length) {
+    usage = estimateContextUsageFromMessages(data.messages);
+  }
+  if (usage) updateContextMeter(usage);
+  else resetContextMeter();
+}
+
+function estimateContextUsageFromMessages(messages, budgetTokens = 32000) {
+  let chars = 0;
+  for (const m of messages) {
+    try {
+      chars += JSON.stringify(m).length;
+    } catch (_) {
+      chars += 200;
+    }
+  }
+  const used = Math.max(0, Math.ceil(chars / 4));
+  const budget = Math.max(1, Number(budgetTokens) || 32000);
+  const usedPct = Math.min(100, Math.round((100 * used) / budget));
+  const remaining = Math.max(0, 100 - usedPct);
+  const level = remaining <= 15 ? "critical" : remaining <= 35 ? "warn" : "ok";
+  return {
+    scope: "turn",
+    used_tokens: used,
+    budget_tokens: budget,
+    used_pct: usedPct,
+    remaining_pct: remaining,
+    level,
+    hint: "（由历史消息估算）",
+  };
+}
+
+function toggleContextRingDetail() {
+  if (!contextRing) return;
+  contextRingOpen = !contextRingOpen;
+  contextRing.classList.toggle("is-open", contextRingOpen);
+  contextRing.setAttribute("aria-expanded", contextRingOpen ? "true" : "false");
+  if (contextRingDetail) {
+    contextRingDetail.hidden = !contextRingOpen;
+  }
+  if (lastContextUsage) updateContextMeter(lastContextUsage);
+  else if (contextRing) {
+    contextRing.title = contextRingOpen
+      ? "发送任务后显示用量"
+      : "发送任务后显示用量（点击查看明细）";
+  }
 }
 
 function renderRich(text) {
@@ -89,7 +294,10 @@ function resetSessionUI() {
   renderChangedBar();
   todoList.innerHTML = "";
   todoEmpty.classList.remove("hidden");
-  setStatus("idle", "Idle");
+  setStatus("idle", "空闲");
+  resetContextMeter();
+  clearAttachedPaths();
+  hideApprovalBar();
 }
 
 function mapStep(step) {
@@ -102,6 +310,7 @@ function showHome() {
   sessionId = null;
   sessionActive = false;
   resetSessionUI();
+  resetContextMeter();
 }
 
 function scrollChat() {
@@ -157,6 +366,18 @@ function addUserBubble(text) {
   scrollChat();
 }
 
+function formatStoppedReason(reason) {
+  const map = {
+    completed: "已完成",
+    max_steps: "达到最大步数",
+    interrupted: "已中断",
+    loop_detected: "检测到循环",
+    retry_exhausted: "重试耗尽",
+    goal_met_forced: "目标已达成（强制收尾）",
+  };
+  return map[reason] || reason || "";
+}
+
 function addFinalBubble(text, meta) {
   if (activeStep != null) {
     const card = stepCards.get(activeStep);
@@ -190,6 +411,34 @@ function addInfoBubble(text) {
   const row = document.createElement("div");
   row.className = "bubble-row agent";
   row.innerHTML = `<div class="msg info"><div class="tag">INFO</div><div class="rich">${renderRich(text)}</div></div>`;
+  timeline.appendChild(row);
+  scrollChat();
+}
+
+/** Collapsed-by-default turn summary (keeps the chat readable). */
+function addTurnSummaryBubble(text) {
+  const body = String(text || "").trim();
+  const row = document.createElement("div");
+  row.className = "bubble-row agent";
+  const msg = document.createElement("div");
+  msg.className = "msg info turn-summary";
+  msg.innerHTML = `<div class="tag">INFO</div>`;
+  const details = document.createElement("details");
+  details.className = "turn-summary-details";
+  // Default collapsed after generation
+  details.open = false;
+  const summary = document.createElement("summary");
+  summary.className = "turn-summary-summary";
+  summary.innerHTML =
+    `<span class="turn-summary-title">本轮自动总结</span>` +
+    `<span class="turn-summary-hint">点击展开</span>`;
+  const content = document.createElement("div");
+  content.className = "rich turn-summary-body";
+  content.innerHTML = renderRich(body);
+  details.appendChild(summary);
+  details.appendChild(content);
+  msg.appendChild(details);
+  row.appendChild(msg);
   timeline.appendChild(row);
   scrollChat();
 }
@@ -331,7 +580,7 @@ function renderChangedBar() {
     btn.type = "button";
     btn.className = `changed-chip${ch.is_new ? " is-new" : ""}`;
     btn.textContent = ch.is_new ? `${ch.path} (new)` : ch.path;
-    btn.title = "View diff in VS Code editor";
+    btn.title = "View diff · Undo/Redo available";
     btn.addEventListener("click", () => openDiff(ch));
     changedList.appendChild(btn);
   }
@@ -418,6 +667,37 @@ function disposeMonacoEditors() {
   }
   monacoMode = null;
   monacoHost.innerHTML = "";
+  activeDiff = null;
+  setDiffActionsVisible(false);
+}
+
+function setDiffActionsVisible(show) {
+  if (!diffActions) return;
+  diffActions.classList.toggle("hidden", !show);
+}
+
+function updateDiffActionButtons() {
+  if (!activeDiff) {
+    if (btnDiffUndo) btnDiffUndo.disabled = true;
+    if (btnDiffRedo) btnDiffRedo.disabled = true;
+    return;
+  }
+  const atModified = activeDiff.applied === "modified";
+  if (btnDiffUndo) {
+    btnDiffUndo.disabled = !atModified;
+    btnDiffUndo.classList.toggle("is-active", !atModified);
+  }
+  if (btnDiffRedo) {
+    btnDiffRedo.disabled = atModified;
+    btnDiffRedo.classList.toggle("is-active", atModified);
+  }
+  const status = document.getElementById("codeStatusRight");
+  if (status) {
+    status.textContent =
+      activeDiff.applied === "modified"
+        ? "Disk = modified · Undo restores original"
+        : "Disk = original · Redo re-applies change";
+  }
 }
 
 async function openCodeViewer(path, content, { modeBadge = "Preview" } = {}) {
@@ -428,6 +708,7 @@ async function openCodeViewer(path, content, { modeBadge = "Preview" } = {}) {
   codeLangLabel.textContent = lang;
   codeModal.classList.remove("hidden");
   disposeMonacoEditors();
+  setDiffActionsVisible(false);
   try {
     const monaco = await loadMonaco();
     monacoMode = "code";
@@ -460,11 +741,20 @@ async function openDiff(ch) {
   codeLangLabel.textContent = lang;
   codeModal.classList.remove("hidden");
   disposeMonacoEditors();
+  activeDiff = {
+    path,
+    old_content: ch.old_content ?? "",
+    new_content: ch.new_content ?? "",
+    is_new: !!ch.is_new,
+    applied: "modified",
+  };
+  setDiffActionsVisible(true);
+  updateDiffActionButtons();
   try {
     const monaco = await loadMonaco();
     monacoMode = "diff";
-    const original = monaco.editor.createModel(ch.old_content ?? "", lang);
-    const modified = monaco.editor.createModel(ch.new_content ?? "", lang);
+    const original = monaco.editor.createModel(activeDiff.old_content, lang);
+    const modified = monaco.editor.createModel(activeDiff.new_content, lang);
     monacoDiff = monaco.editor.createDiffEditor(monacoHost, {
       theme: "vs-dark",
       readOnly: true,
@@ -484,6 +774,116 @@ async function openDiff(ch) {
   }
 }
 
+function formatApiDetail(data, res) {
+  const d = data && data.detail;
+  if (typeof d === "string") return d;
+  if (Array.isArray(d)) {
+    return d.map((x) => x.msg || JSON.stringify(x)).join("; ");
+  }
+  if (d != null) return JSON.stringify(d);
+  return `HTTP ${res.status}`;
+}
+
+function normalizeRelPath(path) {
+  let p = String(path || "").trim().replace(/\\/g, "/");
+  const wd = (workdirInput.value || "").trim().replace(/\\/g, "/");
+  if (wd && p.toLowerCase().startsWith(wd.toLowerCase() + "/")) {
+    p = p.slice(wd.length + 1);
+  }
+  // Strip leading ./ 
+  p = p.replace(/^\.\//, "");
+  return p;
+}
+
+async function applyDiffToDisk(which) {
+  if (!activeDiff || running) return;
+  const wd = workdirInput.value.trim() || "demos";
+  const path = normalizeRelPath(activeDiff.path);
+  if (!path) {
+    alert("Undo/Redo failed: empty path");
+    return;
+  }
+  try {
+    if (which === "original") {
+      if (activeDiff.is_new) {
+        const res = await fetch("/api/fs/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workdir: wd, path }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          // Fallback: write empty / old content if delete endpoint missing (old server)
+          if (res.status === 404) {
+            const w = await fetch("/api/fs/write", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                workdir: wd,
+                path,
+                content: activeDiff.old_content ?? "",
+              }),
+            });
+            const wdData = await w.json().catch(() => ({}));
+            if (!w.ok) {
+              throw new Error(
+                formatApiDetail(wdData, w) +
+                  (w.status === 404
+                    ? " — 请重启 Web 服务：python -m src.web"
+                    : "")
+              );
+            }
+          } else {
+            throw new Error(formatApiDetail(data, res));
+          }
+        }
+      } else {
+        const res = await fetch("/api/fs/write", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            workdir: wd,
+            path,
+            content: activeDiff.old_content ?? "",
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(
+            formatApiDetail(data, res) +
+              (res.status === 404 ? " — 请重启 Web 服务：python -m src.web" : "")
+          );
+        }
+      }
+      activeDiff.applied = "original";
+      codeModeBadge.textContent = "Undone";
+    } else {
+      const res = await fetch("/api/fs/write", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          workdir: wd,
+          path,
+          content: activeDiff.new_content ?? "",
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(
+          formatApiDetail(data, res) +
+            (res.status === 404 ? " — 请重启 Web 服务：python -m src.web" : "")
+        );
+      }
+      activeDiff.applied = "modified";
+      codeModeBadge.textContent = activeDiff.is_new ? "New file" : "Diff";
+    }
+    updateDiffActionButtons();
+    loadFileTree();
+  } catch (err) {
+    alert("Undo/Redo failed: " + err);
+  }
+}
+
 function renderSuggestions(items) {
   suggestionCards.innerHTML = "";
   items.forEach((item, i) => {
@@ -497,8 +897,6 @@ function renderSuggestions(items) {
         <p class="card-desc">${escapeHtml(item.desc)}</p>
       </div>`;
     btn.addEventListener("click", () => {
-      chatInput.value = item.prompt;
-      chatInput.focus();
       startRun(item.prompt);
     });
     suggestionCards.appendChild(btn);
@@ -561,11 +959,44 @@ function handleEvent(data) {
     case "tool_result":
       addToolResult(data.step, data);
       break;
+    case "approval_request":
+      showApprovalRequest(data);
+      break;
+    case "approval_resolved":
+      markToolAwaiting(data.call_id || pendingApprovalCallId, false);
+      if (!data.request_id || data.request_id === pendingApprovalId) {
+        hideApprovalBar();
+      }
+      if (running) setStatus("running", "运行中…");
+      break;
+    case "auth_decision":
+      {
+        const key = data.step != null ? mapStep(data.step) : activeStep;
+        const card = key != null ? stepCards.get(key) : null;
+        const block = card && data.id ? findToolBlock(card, data.id) : null;
+        if (block) {
+          block.classList.remove("awaiting");
+          const status = block.querySelector(".tool-status");
+          if (status && !data.allowed) {
+            status.textContent = data.decision === "deny" ? "已拒绝" : "已拦截";
+          } else if (status && data.decision === "confirm") {
+            status.textContent = "已批准";
+          }
+        }
+      }
+      break;
     case "file_change":
       recordFileChange(data);
       break;
     case "todo_update":
       renderTodos(data.todos || []);
+      break;
+    case "context_usage":
+      updateContextMeter(data);
+      break;
+    case "turn_summary":
+      addTurnSummaryBubble(data.text || "");
+      if (data.context_usage) updateContextMeter(data.context_usage);
       break;
     case "step_end":
       markStepDone(data.step);
@@ -573,17 +1004,19 @@ function handleEvent(data) {
     case "final":
       break;
     case "done":
+      hideApprovalBar();
       addFinalBubble(
         data.final_text || "",
-        `${data.stopped_reason} · ${data.steps} steps` +
+        `${formatStoppedReason(data.stopped_reason)} · ${data.steps} 步` +
           (data.transcript_id ? ` · ${data.transcript_id}` : "")
       );
-      setStatus("idle", "Done");
+      setStatus("idle", "完成");
       sessionActive = true;
       break;
     case "error":
-      addInfoBubble(data.message || "Unknown error");
-      setStatus("err", "Error");
+      hideApprovalBar();
+      addInfoBubble(data.message || "未知错误");
+      setStatus("err", "错误");
       break;
     case "log":
       break;
@@ -666,7 +1099,19 @@ function replayTranscript(data) {
     }
   }
 
-  const changes = data.file_changes || [];
+  // Only this turn's file changes (last turn on session, or top-level file_changes)
+  changedFiles = new Map();
+  renderChangedBar();
+  let changes = [];
+  if (turns.length) {
+    const last = turns[turns.length - 1];
+    if (Array.isArray(last.file_changes) && last.file_changes.length) {
+      changes = last.file_changes;
+    }
+  }
+  if (!changes.length) {
+    changes = data.file_changes || [];
+  }
   for (const ch of changes) recordFileChange(ch);
 
   addFinalBubble(
@@ -674,6 +1119,8 @@ function replayTranscript(data) {
     `${data.stopped_reason || ""} · ${data.steps || step} steps (replay)`
   );
   setStatus("idle", "Replay");
+  // Restore this session/turn's context ring (do not keep previous chat's meter)
+  applyStoredContextUsage(data);
 }
 
 function parseTodoText(result) {
@@ -735,24 +1182,227 @@ async function loadFileTree() {
     }
     const data = await res.json();
     filesWorkdir.textContent = data.workdir || wd;
-    fileTree.innerHTML = "";
-    (data.nodes || []).forEach((node) => {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = `file-node${node.kind === "dir" ? " is-dir" : ""}`;
-      btn.style.paddingLeft = `${8 + (node.depth || 0) * 14}px`;
-      btn.innerHTML = `<span class="icon">${node.kind === "dir" ? "📁" : "📄"}</span><span>${escapeHtml(node.name)}</span>`;
-      if (node.kind === "file") {
-        btn.addEventListener("click", () => openFileWindow(node.path));
-      }
-      fileTree.appendChild(btn);
-    });
-    if (!(data.nodes || []).length) {
-      fileTree.innerHTML = `<div class="todo-empty">Empty folder</div>`;
-    }
+    renderFileTree(data.nodes || []);
   } catch (err) {
     fileTree.innerHTML = `<div class="todo-empty">${escapeHtml(String(err))}</div>`;
   }
+}
+
+/** Flat API nodes → expandable tree. Directories start collapsed. */
+function renderFileTree(nodes) {
+  fileTree.innerHTML = "";
+  if (!nodes.length) {
+    fileTree.innerHTML = `<div class="todo-empty">Empty folder</div>`;
+    return;
+  }
+
+  const rows = [];
+  nodes.forEach((node, index) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    const depth = Number(node.depth) || 0;
+    const isDir = node.kind === "dir";
+    btn.className = `file-node${isDir ? " is-dir is-collapsed" : ""}`;
+    btn.dataset.depth = String(depth);
+    btn.dataset.kind = node.kind || "file";
+    btn.dataset.path = node.path || node.name || "";
+    btn.dataset.index = String(index);
+    btn.style.paddingLeft = `${8 + depth * 14}px`;
+
+    if (isDir) {
+      btn.innerHTML = `
+        <span class="file-chevron" aria-hidden="true">▸</span>
+        <span class="icon">📁</span>
+        <span class="file-name">${escapeHtml(node.name)}</span>`;
+      btn.setAttribute("aria-expanded", "false");
+      btn.title = "Click to expand / collapse · drag to attach";
+      btn.draggable = true;
+      btn.addEventListener("click", () => toggleFileTreeDir(btn));
+      btn.addEventListener("dragstart", (e) => onFileDragStart(e, node.path, "dir"));
+    } else {
+      btn.innerHTML = `
+        <span class="file-chevron-spacer" aria-hidden="true"></span>
+        <span class="icon">📄</span>
+        <span class="file-name">${escapeHtml(node.name)}</span>`;
+      btn.title = "Click to preview · drag to composer to attach";
+      btn.draggable = true;
+      btn.addEventListener("click", () => openFileWindow(node.path));
+      btn.addEventListener("dragstart", (e) => onFileDragStart(e, node.path, "file"));
+    }
+    fileTree.appendChild(btn);
+    rows.push(btn);
+  });
+
+  // Apply initial collapsed visibility
+  rows.forEach((btn) => {
+    if (btn.dataset.kind === "dir" && btn.classList.contains("is-collapsed")) {
+      setFileTreeChildrenHidden(btn, true);
+    }
+  });
+}
+
+function setFileTreeChildrenHidden(dirBtn, hidden) {
+  const depth = Number(dirBtn.dataset.depth) || 0;
+  let el = dirBtn.nextElementSibling;
+  while (el && el.classList.contains("file-node")) {
+    const d = Number(el.dataset.depth) || 0;
+    if (d <= depth) break;
+    if (hidden) {
+      el.classList.add("is-hidden");
+    } else {
+      // Show only direct children; nested dirs keep their own collapse state
+      const parentCollapsed = fileTreeAncestorCollapsed(el, dirBtn);
+      if (!parentCollapsed) {
+        el.classList.remove("is-hidden");
+        if (el.dataset.kind === "dir" && el.classList.contains("is-collapsed")) {
+          setFileTreeChildrenHidden(el, true);
+        }
+      }
+    }
+    el = el.nextElementSibling;
+  }
+}
+
+function fileTreeAncestorCollapsed(nodeEl, stopAt) {
+  const depth = Number(nodeEl.dataset.depth) || 0;
+  let el = nodeEl.previousElementSibling;
+  while (el && el.classList.contains("file-node")) {
+    if (el === stopAt) return false;
+    if (el.dataset.kind === "dir") {
+      const d = Number(el.dataset.depth) || 0;
+      if (d < depth && el.classList.contains("is-collapsed")) return true;
+    }
+    el = el.previousElementSibling;
+  }
+  return false;
+}
+
+function toggleFileTreeDir(dirBtn) {
+  const collapse = !dirBtn.classList.contains("is-collapsed");
+  dirBtn.classList.toggle("is-collapsed", collapse);
+  dirBtn.setAttribute("aria-expanded", collapse ? "false" : "true");
+  const chev = dirBtn.querySelector(".file-chevron");
+  if (chev) chev.textContent = collapse ? "▸" : "▾";
+  setFileTreeChildrenHidden(dirBtn, collapse);
+}
+
+function onFileDragStart(e, path, kind) {
+  if (!e.dataTransfer) return;
+  const payload = JSON.stringify({ path, kind: kind || "file" });
+  e.dataTransfer.setData("application/x-codeagent-path", payload);
+  e.dataTransfer.setData("text/plain", path);
+  e.dataTransfer.effectAllowed = "copy";
+}
+
+function addAttachedPath(path, kind) {
+  const p = String(path || "").trim().replace(/\\/g, "/");
+  if (!p) return;
+  attachedPaths.set(p, { path: p, kind: kind === "dir" ? "dir" : "file" });
+  renderAttachChips();
+}
+
+function removeAttachedPath(path) {
+  attachedPaths.delete(path);
+  renderAttachChips();
+}
+
+function clearAttachedPaths() {
+  attachedPaths = new Map();
+  renderAttachChips();
+}
+
+function renderAttachChips() {
+  if (!attachChips) return;
+  attachChips.innerHTML = "";
+  if (!attachedPaths.size) {
+    attachChips.classList.add("hidden");
+    return;
+  }
+  attachChips.classList.remove("hidden");
+  for (const item of attachedPaths.values()) {
+    const chip = document.createElement("span");
+    chip.className = `attach-chip${item.kind === "dir" ? " is-dir" : ""}`;
+    chip.title = item.path;
+    const label = document.createElement("span");
+    label.className = "attach-chip-name";
+    label.textContent = (item.kind === "dir" ? "📁 " : "📄 ") + item.path;
+    const x = document.createElement("button");
+    x.type = "button";
+    x.className = "attach-chip-x";
+    x.setAttribute("aria-label", `Remove ${item.path}`);
+    x.textContent = "×";
+    x.addEventListener("click", () => removeAttachedPath(item.path));
+    chip.appendChild(label);
+    chip.appendChild(x);
+    attachChips.appendChild(chip);
+  }
+}
+
+function buildTaskWithAttachments(userText) {
+  const text = String(userText || "").trim();
+  if (!attachedPaths.size) return text;
+  const lines = ["请重点关注以下附件（相对 workdir；请先 read_file / list_dir 了解内容）："];
+  for (const item of attachedPaths.values()) {
+    lines.push(`- ${item.kind === "dir" ? "[dir] " : ""}${item.path}`);
+  }
+  if (text) {
+    lines.push("");
+    lines.push("用户需求：");
+    lines.push(text);
+  } else {
+    lines.push("");
+    lines.push("请根据上述附件理解上下文并等待进一步指示；若需求已隐含在文件中，请合理处理。");
+  }
+  return lines.join("\n");
+}
+
+function setupComposerDrop() {
+  const targets = [composer, composerWrap, attachChips].filter(Boolean);
+  let dragDepth = 0;
+
+  const setDropHighlight = (on) => {
+    if (composer) composer.classList.toggle("is-drop-target", on);
+  };
+
+  targets.forEach((el) => {
+    el.addEventListener("dragenter", (e) => {
+      if (!e.dataTransfer) return;
+      e.preventDefault();
+      dragDepth += 1;
+      setDropHighlight(true);
+    });
+    el.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+      setDropHighlight(true);
+    });
+    el.addEventListener("dragleave", () => {
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (dragDepth === 0) setDropHighlight(false);
+    });
+    el.addEventListener("drop", (e) => {
+      e.preventDefault();
+      dragDepth = 0;
+      setDropHighlight(false);
+      let path = "";
+      let kind = "file";
+      const raw = e.dataTransfer?.getData("application/x-codeagent-path");
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw);
+          path = parsed.path || "";
+          kind = parsed.kind || "file";
+        } catch (_) {
+          path = raw;
+        }
+      }
+      if (!path) path = e.dataTransfer?.getData("text/plain") || "";
+      if (path) {
+        addAttachedPath(path, kind);
+        chatInput?.focus();
+      }
+    });
+  });
 }
 
 function openFileWindow(relPath) {
@@ -779,12 +1429,17 @@ async function resetDemos() {
 }
 
 async function startRun(taskText) {
-  const task = (taskText || chatInput.value || "").trim();
+  const typed = (taskText || chatInput.value || "").trim();
+  const task = buildTaskWithAttachments(typed);
   if (!task || running) return;
+
+  // Clear composer immediately so sent text / chips do not linger
+  chatInput.value = "";
+  clearAttachedPaths();
 
   running = true;
   sendBtn.disabled = true;
-  setStatus("running", "Running…");
+  setStatus("running", "运行中…");
   showChat();
 
   // Same session: keep timeline (multi-turn conversation = one history).
@@ -801,6 +1456,14 @@ async function startRun(taskText) {
     }
     stepKeyBase += 1000;
     activeStep = null;
+    // Only show files changed in this turn
+    if (changedBar && changedBar.parentElement === timeline) {
+      chatView.appendChild(changedBar);
+    }
+    changedFiles = new Map();
+    renderChangedBar();
+    // New turn: clear previous turn's ring until this turn's usage arrives
+    resetContextMeter();
   }
 
   addUserBubble(task);
@@ -808,7 +1471,7 @@ async function startRun(taskText) {
   const payload = {
     task,
     workdir: workdirInput.value.trim() || "demos",
-    max_steps: Number(maxStepsInput.value) || 20,
+    max_steps: Number(maxStepsInput.value) || 30,
     session_id: sessionId,
   };
 
@@ -821,7 +1484,7 @@ async function startRun(taskText) {
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       addInfoBubble(err.detail || `HTTP ${res.status}`);
-      setStatus("err", "Blocked");
+      setStatus("err", "已阻塞");
       return;
     }
 
@@ -844,12 +1507,14 @@ async function startRun(taskText) {
     }
   } catch (err) {
     addInfoBubble(String(err));
-    setStatus("err", "Error");
+    setStatus("err", "错误");
   } finally {
+    hideApprovalBar();
     running = false;
     sendBtn.disabled = false;
-    chatInput.value = "";
-    if (runStatus.textContent === "Running…") setStatus("idle", "Idle");
+    if (runStatus.textContent === "运行中…" || runStatus.textContent === "等待授权…") {
+      setStatus("idle", "空闲");
+    }
     loadHistory();
     loadFileTree();
   }
@@ -940,6 +1605,13 @@ composer.addEventListener("submit", (e) => {
   startRun();
 });
 
+if (contextRing) {
+  contextRing.addEventListener("click", (e) => {
+    e.preventDefault();
+    toggleContextRingDetail();
+  });
+}
+
 workdirInput.addEventListener("change", () => {
   workdirInput.dataset.touched = "1";
   loadFileTree();
@@ -948,23 +1620,29 @@ workdirInput.addEventListener("input", () => {
   workdirInput.dataset.touched = "1";
 });
 
-document.getElementById("btnNew").addEventListener("click", () => {
-  showHome();
-  chatInput.focus();
-});
-
 document.querySelector('.nav-item[data-view="home"]').addEventListener("click", () => {
   showHome();
 });
 
-document.getElementById("btnRefreshHistory").addEventListener("click", loadHistory);
-document.getElementById("btnResetDemos").addEventListener("click", resetDemos);
 document.getElementById("btnOpenFolder").addEventListener("click", openFolderModal);
 document.getElementById("btnFolderGo").addEventListener("click", () => browseFolder(folderPathInput.value.trim()));
 document.getElementById("btnFolderSelect").addEventListener("click", selectFolder);
 document.getElementById("btnToggleRight").addEventListener("click", () => {
   workspace.classList.toggle("right-collapsed");
 });
+
+if (btnDiffUndo) {
+  btnDiffUndo.addEventListener("click", () => applyDiffToDisk("original"));
+}
+if (btnApprovalAllow) {
+  btnApprovalAllow.addEventListener("click", () => respondApproval(true));
+}
+if (btnApprovalDeny) {
+  btnApprovalDeny.addEventListener("click", () => respondApproval(false));
+}
+if (btnDiffRedo) {
+  btnDiffRedo.addEventListener("click", () => applyDiffToDisk("modified"));
+}
 
 document.querySelectorAll(".rp-tab").forEach((tab) => {
   tab.addEventListener("click", () => switchRightTab(tab.dataset.tab));
@@ -983,6 +1661,8 @@ folderPathInput.addEventListener("keydown", (e) => {
 
 historySearch.addEventListener("input", () => renderHistory(historyCache));
 
+setupComposerDrop();
 loadMeta();
 loadHistory();
+resetContextMeter();
 chatInput.focus();

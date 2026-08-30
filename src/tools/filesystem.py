@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from src.agent.permissions import PermissionGate
+from src.tools.fs_noise import is_noise_entry
 from src.tools.base import FunctionTool, ToolRegistry
 
 
@@ -52,6 +53,8 @@ def register_filesystem_tools(
 
         entries: list[str] = []
         for child in sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+            if is_noise_entry(child.name):
+                continue
             try:
                 child.relative_to(gate.workdir)
             except ValueError:
@@ -114,7 +117,10 @@ def register_filesystem_tools(
             except (ValueError, OSError):
                 continue
             if resolved.is_file():
-                matches.append(resolved.relative_to(root).as_posix())
+                rel = resolved.relative_to(root).as_posix()
+                if any(is_noise_entry(part) for part in Path(rel).parts):
+                    continue
+                matches.append(rel)
         if not matches:
             return f"(no files matched pattern {pattern!r})"
         return _truncate("\n".join(matches), max_output_chars)
@@ -137,6 +143,8 @@ def register_filesystem_tools(
                 "required": ["path"],
             },
             handler=read_file,
+            risk_level="low",
+            is_readonly=True,
         )
     )
     registry.register(
@@ -161,6 +169,8 @@ def register_filesystem_tools(
                 "required": ["path", "content"],
             },
             handler=write_file,
+            risk_level="medium",
+            is_readonly=False,
         )
     )
     registry.register(
@@ -178,6 +188,8 @@ def register_filesystem_tools(
                 "required": [],
             },
             handler=list_dir,
+            risk_level="low",
+            is_readonly=True,
         )
     )
     registry.register(
@@ -211,6 +223,8 @@ def register_filesystem_tools(
                 "required": ["path", "old_string", "new_string"],
             },
             handler=edit_file,
+            risk_level="medium",
+            is_readonly=False,
         )
     )
     registry.register(
@@ -231,6 +245,8 @@ def register_filesystem_tools(
                 "required": ["pattern"],
             },
             handler=glob_files,
+            risk_level="low",
+            is_readonly=True,
         )
     )
 
@@ -242,10 +258,14 @@ def snapshot_workdir(workdir: Path, *, max_entries: int = 40) -> str:
         children = sorted(workdir.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
     except OSError as exc:
         return f"(unable to list workdir: {exc})"
-    for child in children[:max_entries]:
+    for child in children[: max_entries * 2]:
+        if is_noise_entry(child.name):
+            continue
         kind = "dir" if child.is_dir() else "file"
         entries.append(f"[{kind}] {child.name}")
-    more = len(children) - max_entries
+        if len(entries) >= max_entries:
+            break
+    more = max(0, len([c for c in children if not is_noise_entry(c.name)]) - len(entries))
     if more > 0:
         entries.append(f"... and {more} more")
     return "\n".join(entries) if entries else "(empty)"

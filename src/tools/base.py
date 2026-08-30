@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Literal, Protocol, Iterable
+
+RiskLevel = Literal["low", "medium", "high"]
 
 
 class Tool(Protocol):
@@ -24,12 +26,14 @@ Handler = Callable[[dict[str, Any]], str]
 
 @dataclass
 class FunctionTool:
-    """Simple concrete tool: OpenAI-style schema + local handler."""
+    """Concrete tool: OpenAI-style schema + local handler + risk metadata."""
 
     name: str
     description: str
     parameters: dict[str, Any]
     handler: Handler
+    risk_level: RiskLevel = "medium"
+    is_readonly: bool = False
 
     def run(self, arguments: dict[str, Any]) -> str:
         try:
@@ -53,10 +57,18 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return sorted(self._tools)
 
-    def openai_tools(self) -> list[dict[str, Any]]:
-        """Export schemas for chat.completions `tools=` parameter."""
+    def openai_tools(self, names: Iterable[str] | None = None) -> list[dict[str, Any]]:
+        """Export schemas for chat.completions `tools=` parameter.
+
+        If ``names`` is given, only those tools are included (least privilege).
+        """
+        if names is None:
+            selected = list(self._tools.values())
+        else:
+            allow = set(names)
+            selected = [t for t in self._tools.values() if t.name in allow]
         out: list[dict[str, Any]] = []
-        for tool in self._tools.values():
+        for tool in selected:
             out.append(
                 {
                     "type": "function",

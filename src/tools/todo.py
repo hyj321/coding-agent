@@ -73,9 +73,13 @@ def register_todo_tools(registry: ToolRegistry, store: TodoStore | None = None) 
         FunctionTool(
             name="todo_write",
             description=(
-                "Create or replace the agent's task checklist for the current run. "
-                "Use this to plan before acting on non-trivial tasks, then update statuses "
-                "as you progress. Prefer exactly one item with status in_progress. "
+                "Create or replace the agent's coarse checklist for the current run. "
+                "For non-trivial tasks use 3–5 phase-level items "
+                "(e.g. locate failure → minimal fix → run tests)—not one item per file "
+                "or per tool call. Prefer at most one item in_progress. "
+                "Update only at phase boundaries; you MAY call todo_write in the SAME "
+                "assistant turn as read_file/glob/edit_file (do not spend a turn on "
+                "planning alone). Skip entirely for trivial one-shot edits. "
                 "Statuses: pending | in_progress | completed | cancelled."
             ),
             parameters={
@@ -107,6 +111,8 @@ def register_todo_tools(registry: ToolRegistry, store: TodoStore | None = None) 
                 "required": ["todos"],
             },
             handler=todo_write,
+            risk_level="low",
+            is_readonly=False,
         )
     )
     return store
