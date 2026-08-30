@@ -5,7 +5,8 @@ Pipeline: Permission Manager → Risk Assessment → Allow / Confirm / Deny → 
 - Path sandbox: file ops must stay under workdir
 - Sensitive paths: always deny (.env, keys, .ssh, …)
 - Tool metadata: risk_level (low|medium|high) + is_readonly from Registry
-- Shell policy: hard-deny patterns + arg heuristics that may raise risk
+- Shell policy: hard-deny + network/install (NETWORK_POLICY) + subprocess
+  sensitive-read heuristics (python -c / node -e / head|tail / …)
 - Approval modes: auto | ask | never
 """
 
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 RiskLevel = Literal["low", "medium", "high"]
+NetworkPolicy = Literal["high", "deny", "allow"]
 
 _RISK_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
 
@@ -78,6 +80,24 @@ _HIGH_SHELL_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\breg\s+delete\b", re.I),
 ]
 
+# Sec-A / S2: network fetch or package install (policy: high | deny | allow)
+_NETWORK_INSTALL_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\bpip(?:\d+)?\s+install\b", re.I),
+    re.compile(r"\bpython(?:\d+(?:\.\d+)*)?\s+-m\s+pip\s+install\b", re.I),
+    re.compile(r"\bpy\s+-m\s+pip\s+install\b", re.I),
+    re.compile(r"\buv\s+pip\s+install\b", re.I),
+    re.compile(r"\buv\s+add\b", re.I),
+    re.compile(r"\bpoetry\s+add\b", re.I),
+    re.compile(r"\bnpm\s+(?:install|i|add)\b", re.I),
+    re.compile(r"\byarn\s+(?:add|install)\b", re.I),
+    re.compile(r"\bpnpm\s+(?:add|install)\b", re.I),
+    re.compile(r"\bcurl\b", re.I),
+    re.compile(r"\bwget\b", re.I),
+    re.compile(r"\bInvoke-WebRequest\b", re.I),
+    re.compile(r"\bInvoke-RestMethod\b", re.I),
+    re.compile(r"\biwr\b", re.I),
+]
+
 # Basename / path patterns that must never be read or written via tools.
 _SENSITIVE_BASENAME_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^\.env$", re.I),
@@ -93,13 +113,42 @@ _SENSITIVE_BASENAME_PATTERNS: list[re.Pattern[str]] = [
 
 _SENSITIVE_DIR_NAMES = frozenset({".ssh", "secrets"})
 
+# Token forms that may appear inside python -c / node -e strings.
+_SENSITIVE_TOKEN_RE = re.compile(
+    r"(?:^|[\s\"'`=/\\])("
+    r"\.env(?:\.[A-Za-z0-9_.-]+)?|"
+    r"[^\s\"'`]*\.pem|"
+    r"[^\s\"'`]*\.key|"
+    r"id_rsa(?:\.[A-Za-z0-9_.-]+)?|"
+    r"id_ed25519(?:\.[A-Za-z0-9_.-]+)?|"
+    r"id_dsa(?:\.[A-Za-z0-9_.-]+)?|"
+    r"[^\s\"'`]*\.p12|"
+    r"credentials\.json|"
+    r"\.ssh|"
+    r"secrets/"
+    r")(?:[\s\"'`]|$)",
+    re.I,
+)
+
 # Shell commands that print a file — check their path argument for secrets.
 _SHELL_READ_PATTERNS: list[re.Pattern[str]] = [
     re.compile(
-        r"\b(?:cat|type|Get-Content|gc)\s+(?:-[a-zA-Z]+\s+)*[\"']?([^\s\"'|;&>]+)",
+        r"\b(?:cat|type|Get-Content|gc|head|tail|less|more|Get-Content\.exe)\s+"
+        r"(?:-[a-zA-Z]+(?:\s+[^\s\"'|;&>]+)?\s+)*[\"']?([^\s\"'|;&>]+)",
         re.I,
     ),
 ]
+
+# Interpreter one-liners that can open files (Sec-B / S3).
+_INTERPRETER_EVAL_RE = re.compile(
+    r"\b(?:python(?:\d+(?:\.\d+)*)?|py|node|nodejs|deno)\s+"
+    r"(?:-\w+\s+)*-[ce]\s+",
+    re.I,
+)
+_POWERSHELL_CMD_RE = re.compile(
+    r"\b(?:powershell|pwsh)(?:\.exe)?\s+(?:-[a-zA-Z]+\s+)*-(?:Command|c)\s+",
+    re.I,
+)
 
 
 @dataclass(frozen=True)
@@ -121,6 +170,13 @@ def _max_risk(a: RiskLevel, b: RiskLevel) -> RiskLevel:
     return a if _RISK_RANK[a] >= _RISK_RANK[b] else b
 
 
+def parse_network_policy(value: str | None) -> NetworkPolicy:
+    raw = (value or "high").strip().lower()
+    if raw in {"high", "deny", "allow"}:
+        return raw  # type: ignore[return-value]
+    return "high"
+
+
 def is_sensitive_path(user_path: str | Path) -> bool:
     """Return True if the path looks like credentials / secrets."""
     try:
@@ -136,24 +192,78 @@ def is_sensitive_path(user_path: str | Path) -> bool:
     return any(p.search(name) for p in _SENSITIVE_BASENAME_PATTERNS)
 
 
+def command_mentions_sensitive(command: str) -> str | None:
+    """Return a sensitive token found in command text, else None."""
+    m = _SENSITIVE_TOKEN_RE.search(command or "")
+    if m:
+        return m.group(1)
+    for tok in re.findall(r"[^\s\"'|;&<>]+", command or ""):
+        cleaned = tok.strip("\"'`")
+        if cleaned and is_sensitive_path(cleaned):
+            return cleaned
+    return None
+
+
 def _shell_sensitive_targets(command: str) -> list[str]:
     hits: list[str] = []
     for pat in _SHELL_READ_PATTERNS:
         for match in pat.finditer(command):
-            target = match.group(1).strip()
+            target = match.group(1).strip().strip("\"'")
             if target and is_sensitive_path(target):
                 hits.append(target)
     return hits
 
 
-def assess_shell_risk(command: str) -> tuple[RiskLevel, str | None]:
+def _subprocess_sensitive_deny(command: str) -> str | None:
+    """Deny common interpreter/shell patterns that read secrets (S3)."""
+    cmd = command or ""
+    sensitive = _shell_sensitive_targets(cmd)
+    if sensitive:
+        return (
+            "已拒绝 shell 中的敏感路径 denied sensitive path in shell command: "
+            f"{sensitive[0]!r}"
+        )
+
+    if _INTERPRETER_EVAL_RE.search(cmd) or _POWERSHELL_CMD_RE.search(cmd):
+        hit = command_mentions_sensitive(cmd)
+        if hit:
+            return (
+                "已拒绝解释器读密 denied subprocess sensitive read "
+                f"(interpreter -c/-e/-Command mentions {hit!r})"
+            )
+    return None
+
+
+def looks_like_network_or_install(command: str) -> bool:
+    return any(p.search(command or "") for p in _NETWORK_INSTALL_PATTERNS)
+
+
+def assess_shell_risk(
+    command: str,
+    *,
+    network_policy: NetworkPolicy = "high",
+) -> tuple[RiskLevel, str | None]:
     """Return (risk, hard_deny_reason). hard_deny_reason set ⇒ must Deny."""
     for pat in _HARD_DENY_PATTERNS:
         if pat.search(command):
             return "high", f"hard-denied dangerous shell pattern: {pat.pattern}"
-    sensitive = _shell_sensitive_targets(command)
-    if sensitive:
-        return "high", f"已拒绝 shell 中的敏感路径 denied sensitive path in shell command: {sensitive[0]!r}"
+
+    sub_deny = _subprocess_sensitive_deny(command)
+    if sub_deny:
+        return "high", sub_deny
+
+    policy = parse_network_policy(network_policy)
+    if looks_like_network_or_install(command):
+        if policy == "deny":
+            return (
+                "high",
+                "已拒绝网络/安装命令 denied by NETWORK_POLICY=deny "
+                "(pip/npm/curl/wget/…)",
+            )
+        if policy == "high":
+            return "high", None
+        # allow: do not elevate for network/install alone
+
     if any(p.search(command) for p in _HIGH_SHELL_PATTERNS):
         return "high", None
     return "medium", None
@@ -170,6 +280,7 @@ class PermissionGate:
         ask_fn: AskFn | None = None,
         deny_high: bool = False,
         ask_min_risk: RiskLevel = "medium",
+        network_policy: NetworkPolicy | str = "high",
     ) -> None:
         self.workdir = workdir.resolve()
         self.approval = approval
@@ -177,6 +288,9 @@ class PermissionGate:
         self.deny_high = deny_high
         self.ask_min_risk: RiskLevel = (
             ask_min_risk if ask_min_risk in _RISK_RANK else "medium"
+        )
+        self.network_policy: NetworkPolicy = parse_network_policy(
+            network_policy if isinstance(network_policy, str) else str(network_policy)
         )
         self._registry: Any | None = None
 
@@ -218,7 +332,6 @@ class PermissionGate:
         """Compute effective risk and optional hard-deny reason."""
         base_risk, _readonly = self._tool_meta(tool_name)
 
-        # Path-bearing tools: sensitive files are always denied.
         if tool_name in {"read_file", "write_file", "edit_file"}:
             path_arg = arguments.get("path")
             if path_arg is not None and is_sensitive_path(str(path_arg)):
@@ -226,7 +339,9 @@ class PermissionGate:
 
         if tool_name == "run_shell":
             command = str(arguments.get("command") or "")
-            shell_risk, shell_deny = assess_shell_risk(command)
+            shell_risk, shell_deny = assess_shell_risk(
+                command, network_policy=self.network_policy
+            )
             if shell_deny:
                 return "high", shell_deny
             return _max_risk(base_risk, shell_risk), None
@@ -248,7 +363,6 @@ class PermissionGate:
         if risk == "low":
             return AuthDecision(True, "ok (low risk)", risk_level=risk)
 
-        # High: optional hard deny (legacy Web) even under approval=auto
         if risk == "high" and self.deny_high:
             return AuthDecision(
                 False,
@@ -256,7 +370,6 @@ class PermissionGate:
                 risk_level=risk,
             )
 
-        # medium / high
         if self.approval == ApprovalMode.AUTO:
             return AuthDecision(
                 True,
@@ -270,7 +383,6 @@ class PermissionGate:
                 risk_level=risk,
             )
 
-        # ASK — only prompt when risk >= ask_min_risk (Web default: medium+)
         if _RISK_RANK[risk] < _RISK_RANK[self.ask_min_risk]:
             return AuthDecision(
                 True,

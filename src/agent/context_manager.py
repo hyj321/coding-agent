@@ -106,6 +106,9 @@ class ContextState:
     last_failed_preview: str = ""
     # Cost-B: injected each step from TaskBudget.format_line(...)
     budget_line: str = ""
+    # X3: path|offset|limit → {mtime, summary, chars} for soft-dedup reads
+    read_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+    soft_dedup_events: int = 0
 
     def note_path(self, path: str | None) -> None:
         if not path:
@@ -332,6 +335,81 @@ C. Blind list_dir of the whole repo + full-file read without a search target is 
 """
         return self._system_prompt_cache
 
+    def _read_cache_key(self, args: dict[str, Any]) -> str:
+        path = str(args.get("path") or "").replace("\\", "/").strip()
+        off = args.get("offset")
+        lim = args.get("limit")
+        return f"{path}|o={off if off is not None else ''}|l={lim if lim is not None else ''}"
+
+    def _path_mtime(self, rel: str) -> float | None:
+        if not rel:
+            return None
+        try:
+            candidate = (self.workdir / rel).resolve()
+            candidate.relative_to(self.workdir.resolve())
+            if not candidate.is_file():
+                return None
+            return float(candidate.stat().st_mtime)
+        except (OSError, ValueError):
+            return None
+
+    def _invalidate_read_cache(self, rel: str | None) -> None:
+        if not rel:
+            return
+        prefix = rel.replace("\\", "/").strip() + "|"
+        drop = [k for k in self.state.read_cache if k.startswith(prefix)]
+        for k in drop:
+            self.state.read_cache.pop(k, None)
+
+    def _try_soft_dedup_read(
+        self,
+        args: dict[str, Any],
+        result: str,
+    ) -> str | None:
+        """If same path+slice already read and mtime unchanged, return short reuse note."""
+        if str(result).startswith("Error"):
+            return None
+        key = self._read_cache_key(args)
+        path = str(args.get("path") or "").replace("\\", "/").strip()
+        mtime = self._path_mtime(path)
+        if mtime is None:
+            return None
+        prev = self.state.read_cache.get(key)
+        if (
+            isinstance(prev, dict)
+            and prev.get("mtime") == mtime
+            and isinstance(prev.get("summary"), str)
+            and prev["summary"]
+        ):
+            self.state.soft_dedup_events += 1
+            summary = prev["summary"]
+            chars = int(prev.get("chars") or 0)
+            return (
+                f"[soft-dedup] `{path}` unchanged (mtime={mtime:.0f}); "
+                f"reusing prior read ({chars}c). Prior excerpt:\n{summary}"
+            )
+        return None
+
+    def _store_read_cache(self, args: dict[str, Any], compressed: str) -> None:
+        if str(compressed).startswith("Error") or compressed.startswith("[soft-dedup]"):
+            return
+        key = self._read_cache_key(args)
+        path = str(args.get("path") or "").replace("\\", "/").strip()
+        mtime = self._path_mtime(path)
+        if mtime is None:
+            return
+        flat = " ".join(compressed.split())
+        excerpt = flat[:280] + ("…" if len(flat) > 280 else "")
+        self.state.read_cache[key] = {
+            "mtime": mtime,
+            "summary": excerpt,
+            "chars": len(compressed),
+        }
+        # Cap cache size
+        if len(self.state.read_cache) > 32:
+            for old in list(self.state.read_cache.keys())[:8]:
+                self.state.read_cache.pop(old, None)
+
     def observe_tool(
         self,
         *,
@@ -344,22 +422,36 @@ C. Blind list_dir of the whole repo + full-file read without a search target is 
         soft, hard, stub = limits_for_tool(self._guideline, tool_name)
         soft = min(soft, self.observation_soft_chars)
         hard = min(hard, self.observation_hard_chars)
-        compressed = compress_tool_result(
-            tool_name,
-            result,
-            soft_limit=soft,
-            hard_limit=hard,
-            stub_limit=stub,
-            tier="full",
-        )
-        if compressed != result:
-            self.state.compress_events += 1
+
+        # X3: soft-dedup unchanged file reads before full compress
+        soft_hit: str | None = None
+        if tool_name == "read_file" and isinstance(raw_args, dict):
+            soft_hit = self._try_soft_dedup_read(raw_args, result)
+
+        if soft_hit is not None:
+            compressed = soft_hit
+        else:
+            compressed = compress_tool_result(
+                tool_name,
+                result,
+                soft_limit=soft,
+                hard_limit=hard,
+                stub_limit=stub,
+                tier="full",
+            )
+            if compressed != result:
+                self.state.compress_events += 1
 
         paths = extract_paths_from_args(raw_args)
         for p in paths:
             self.state.note_path(p)
 
         ok = not str(result).startswith("Error")
+        if soft_hit is None and tool_name == "read_file" and isinstance(raw_args, dict) and ok:
+            self._store_read_cache(raw_args, compressed)
+        if ok and tool_name in {"write_file", "edit_file"} and isinstance(raw_args, dict):
+            self._invalidate_read_cache(str(raw_args.get("path") or ""))
+
         failedish = (not ok) or bool(
             re.search(r"(?m)^(FAILED|ERROR)\b|exit_code:\s*[1-9]", compressed)
         )
@@ -601,11 +693,19 @@ C. Blind list_dir of the whole repo + full-file read without a search target is 
             return "\n".join([lines[0], *parts, *lines[1:]])
         return base + "\n" + "\n".join(parts)
 
-    def ensure_task_goal(self, user_task: str) -> None:
-        """Set goal once from the user task if not already present."""
-        self.state.task = user_task or self.state.task
-        if user_task and not self.task_state.goal:
-            self.task_state.goal = user_task.strip()[:500]
+    def ensure_task_goal(self, user_task: str, *, replace: bool = False) -> None:
+        """Set / refresh goal from the latest user task.
+
+        ``replace=True`` on each new user turn so hydrated working_memory does not
+        keep a stale goal (e.g. prior \"改成输出3\") that skews CompletionGate.
+        """
+        text = (user_task or "").strip()
+        if text:
+            self.state.task = text
+        elif user_task is not None:
+            self.state.task = user_task or self.state.task
+        if text and (replace or not self.task_state.goal):
+            self.task_state.goal = text[:500]
 
     def _root_state_block(self) -> str:
         """Force re-injection of MEMORY + focus + open todos after a fold."""
@@ -811,6 +911,7 @@ C. Blind list_dir of the whole repo + full-file read without a search target is 
             "todos_text": self.state.todos_text,
             "compress_events": self.state.compress_events,
             "phase_compress_events": self.state.phase_compress_events,
+            "soft_dedup_events": self.state.soft_dedup_events,
             "fold_events": self.state.fold_events,
             "microcompact_events": self.state.microcompact_events,
             "guideline_updates": self.state.guideline_updates,

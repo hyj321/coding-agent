@@ -281,8 +281,16 @@ function showApprovalRequest(data) {
   pendingApprovalCallId = data.call_id || null;
   const risk = (data.risk_level || "medium").toLowerCase();
   if (approvalRisk) approvalRisk.textContent = risk;
-  if (approvalTool) approvalTool.textContent = data.tool_name || "tool";
-  if (approvalSummary) approvalSummary.textContent = data.summary || "";
+  if (approvalTool) {
+    approvalTool.textContent = data.tool_name || "tool";
+  }
+  if (approvalSummary) {
+    const bits = [data.summary || ""];
+    if (risk === "high") {
+      bits.push("（High：安装/网络/破坏性操作 — 确认后再允许）");
+    }
+    approvalSummary.textContent = bits.filter(Boolean).join("\n");
+  }
   if (approvalBar) {
     approvalBar.classList.toggle("is-high", risk === "high");
     approvalBar.classList.remove("hidden");
@@ -290,7 +298,7 @@ function showApprovalRequest(data) {
   if (btnApprovalAllow) btnApprovalAllow.disabled = false;
   if (btnApprovalDeny) btnApprovalDeny.disabled = false;
   markToolAwaiting(pendingApprovalCallId, true);
-  setStatus("running", "等待授权…");
+  setStatus("running", risk === "high" ? "等待 High 授权…" : "等待授权…");
   approvalBar?.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
@@ -681,6 +689,49 @@ function addInfoBubble(text) {
   row.innerHTML = `<div class="msg info"><div class="tag">INFO</div><div class="rich">${renderRich(text)}</div></div>`;
   timeline.appendChild(row);
   scrollChat();
+}
+
+/** Guardrail / policy bubble (completion evidence, deny, soft-dedup). */
+function addGuardBubble(tag, text, kind = "guard") {
+  const row = document.createElement("div");
+  row.className = "bubble-row agent";
+  const msg = document.createElement("div");
+  msg.className = `msg info guard-bubble guard-${kind}`;
+  msg.innerHTML =
+    `<div class="tag">${escapeHtml(tag)}</div>` +
+    `<div class="rich">${renderRich(String(text || ""))}</div>`;
+  row.appendChild(msg);
+  timeline.appendChild(row);
+  scrollChat();
+}
+
+function formatCompletionGateBubble(data) {
+  const reason = String(data.reason || "");
+  const text = String(data.text || "").trim();
+  if (reason === "fake_green" || reason === "fake_green_warn" || text.includes("[fake_green]")) {
+    return {
+      tag: "FAKE_GREEN",
+      kind: "fake",
+      body:
+        text ||
+        "假绿拦截：仅改了测试文件却测绿，请先改源文件再验证。",
+    };
+  }
+  if (data.blocked) {
+    return {
+      tag: "EVIDENCE",
+      kind: "evidence",
+      body:
+        text ||
+        `完成被拒（${reason || "missing evidence"}）：请先跑测试 / 补齐 Mustlist 证据。` +
+          (data.nudge != null ? `（催促 ${data.nudge}/${data.max_nudges || "?"}）` : ""),
+    };
+  }
+  return {
+    tag: "EVIDENCE",
+    kind: "warn",
+    body: text || `完成闸放行：${reason || "ok"}`,
+  };
 }
 
 /** Collapsed-by-default turn summary (keeps the chat readable). */
@@ -1205,6 +1256,13 @@ function handleEvent(data) {
     case "start":
       addInfoBubble(`workdir: ${data.workdir}`);
       if (data.session_id) sessionId = data.session_id;
+      if (data.approval === "ask") {
+        addGuardBubble(
+          "POLICY",
+          "Web 审批：**Medium/High** 工具需点允许；`.env` / 密钥等敏感路径与 hard-deny **始终拒绝**；`pip`/`curl` 等为 High。",
+          "policy"
+        );
+      }
       break;
     case "run_start":
       resetCostPanel(data.max_steps || Number(maxStepsInput && maxStepsInput.value) || 30);
@@ -1254,11 +1312,28 @@ function handleEvent(data) {
       break;
     case "approval_request":
       showApprovalRequest(data);
+      addGuardBubble(
+        "APPROVAL",
+        `等待授权 · **${data.risk_level || "medium"}** · \`${data.tool_name || "tool"}\`\n` +
+          `${data.summary || ""}`,
+        (data.risk_level || "").toLowerCase() === "high" ? "high" : "policy"
+      );
       break;
     case "approval_resolved":
       markToolAwaiting(data.call_id || pendingApprovalCallId, false);
       if (!data.request_id || data.request_id === pendingApprovalId) {
         hideApprovalBar();
+      }
+      if (data.allowed === false || data.reason === "cancelled") {
+        addGuardBubble(
+          "APPROVAL",
+          data.reason === "cancelled"
+            ? "授权已取消（任务停止）"
+            : "你已拒绝该工具调用，Agent 将收到拒绝结果并继续。",
+          "deny"
+        );
+      } else if (data.allowed) {
+        addGuardBubble("APPROVAL", "已允许，继续执行。", "ok");
       }
       if (running) setStatus("running", "运行中…");
       break;
@@ -1276,7 +1351,44 @@ function handleEvent(data) {
             status.textContent = "已批准";
           }
         }
+        if (!data.allowed) {
+          const risk = data.risk_level ? ` · ${data.risk_level}` : "";
+          addGuardBubble(
+            "DENY",
+            `权限门拒绝 \`${data.name || "tool"}\`${risk}\n${data.reason || ""}`,
+            "deny"
+          );
+        }
       }
+      break;
+    case "completion_gate":
+      {
+        const g = formatCompletionGateBubble(data);
+        addGuardBubble(g.tag, g.body, g.kind);
+        setStatus("running", data.blocked ? "证据不足，继续…" : "运行中…");
+      }
+      break;
+    case "soft_dedup":
+      addGuardBubble(
+        "DEDUP",
+        data.text ||
+          `[soft-dedup] 文件未变，复用上次读取（${data.path || "?"}）`,
+        "dedup"
+      );
+      break;
+    case "action_dedup":
+      addGuardBubble(
+        "DEDUP",
+        `同一步内重复调用 \`${data.name || "tool"}\`，复用结果。`,
+        "dedup"
+      );
+      break;
+    case "strategy_blocked":
+      addGuardBubble(
+        "BLOCK",
+        `策略已耗尽并硬拦截：\`${data.name || "tool"}\`（勿重复同一失败 fingerprint）。`,
+        "deny"
+      );
       break;
     case "file_change":
       recordFileChange(data);

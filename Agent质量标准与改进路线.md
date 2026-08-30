@@ -8,7 +8,7 @@
 
 **当前总判：** 作业级 / 答辩级已达标；离「严格好 Agent」还差一层——主要在决策机械性、成本硬闸、安全深度、离线评测闭环；**Capability 工具面已较齐（含 grep），缺口在 Search-first 行为、测试/git 一等工具、edit 护栏与能力 eval。**
 
-**推进状态：** ① Capability **Cap-A/B/C 已落地**。② 决策合理 **Dec-A/B/C 已落地**。③ 成本可控 **Cost-A/B/C 已落地**（硬闸 + 可见/账单 + offline eval）；下一横切可转 **P1**（验证/安全）。
+**推进状态：** ①～⑥ Cap/Dec/Cost/Ver/Sec/Imp **已落地**；另补 **Web 护栏可见 + X3 soft-dedup**；live 基线见 §13（`live_post_p1_20260830.json`）。
 
 ---
 
@@ -27,14 +27,14 @@
 |------|------|--------|
 | 能力完整 | A- | Cap-A/B/C 齐：grep+护栏+run_tests/git+offline/live eval；缺 live steps 数字时先跑 `--live` |
 | 决策合理 | A- | Dec-A/B/C 齐：cycle/BLOCK/停滞 + Skill + 离线 decision eval；live pathology 列已挂 |
-| 上下文有效 | A- | 压缩/预算/Current State 扎实；长会话语义记忆仍弱 |
-| 执行可靠 | B+ | 错误回传、配对修复、取消/steer 有；Web 审批 UX 不全 |
-| 结果可验证 | A- | Evidence Gate + 测试解析是亮点；证据种类偏窄 |
+| 上下文有效 | A | 压缩/预算/Current State + **X3 soft-dedup**（同文件 mtime 未变复用摘要） |
+| 执行可靠 | A- | Web 审批条 + DENY/EVIDENCE/FAKE_GREEN 时间线气泡；取消/steer 有 |
+| 结果可验证 | A | Ver-A/B：Mustlist（测绿+源变更）+ 假绿 block/warn；`check_ver_a` |
 | 成本可控 | A- | Cost-A/B/C 齐：硬闸 + 预算可见/cost_report + offline/live eval；基线见 §13 |
-| 安全可控 | B+ | 沙箱/三级风险/敏感路径到位；无 OS 沙箱、链式 IFC、网络策略 |
-| 持续改进 | C+ | transcript + 冒烟有；缺轨迹评测、失败归因、自动改 Skill |
+| 安全可控 | A- | Sec-A/B：`NETWORK_POLICY` + 解释器读密启发式；残余风险已披露；S1/S4 缓做 |
+| 持续改进 | B+ | Imp-A：`run_suite_eval` 统一表（完成/步数/违规/病理）；I2/I3 缓做 |
 
-**目标（交付后 1～2 周可冲）：** 决策 / 成本 / 持续改进各至少升半档；六项优先改造全部勾完。
+**目标（交付后 1～2 周可冲）：** 六项优先改造已勾完；缓做项（C4/D5/S1/S4/I2/I3）与 live 复跑作答辩加分。
 
 ---
 
@@ -569,9 +569,9 @@ live Capability 表新增 `pathology` 列：正常任务应为 `0`。
 
 | ID | 缺口 | 建议动作 | 调研关键词 | 状态 |
 |----|------|----------|------------|------|
-| X1 | 压缩是否丢关键信息不可测 | 抽检：压缩前后关键路径/断言是否仍在 | context compaction eval, ACON | [ ] |
+| X1 | 压缩是否丢关键信息不可测 | 抽检：压缩前后关键路径/断言是否仍在 | context compaction eval, ACON | [x] |
 | X2 | 跨 run 语义记忆弱 | 结构化 episode / 失败策略库；先规则后向量 | agent memory episodes, working memory | [ ] |
-| X3 | 同文件未变仍重读全文 | soft-dedup：mtime 未变则回摘要 | soft dedup tool result, Kimi tool-dedup | [ ] |
+| X3 | 同文件未变仍重读全文 | soft-dedup：mtime 未变则回摘要 | soft dedup tool result, Kimi tool-dedup | [x] |
 
 ### 4.3 与计划书
 
@@ -580,7 +580,8 @@ live Capability 表新增 `pathology` 列：正常任务应为 `0`。
 ### 4.4 验收
 
 - 超预算长对话不炸；关键文件名/测试名压缩后仍可被模型引用。  
-- 连续两次 `read_file` 同路径且未改文件，第二次 token 明显更少。
+- 连续两次 `read_file` 同路径且未改文件，第二次为 `[soft-dedup]` 摘要（smoke 已覆盖）；Web 出 **DEDUP** 气泡。  
+- **X1：** `python -m scripts.check_x1`；`run_context_eval --offline`；suite 行 `context:obs-pytest-retain` / `obs-state-paths` / `fold-retain` / `microcompact-recent`。
 
 ---
 
@@ -596,43 +597,182 @@ live Capability 表新增 `pathology` 列：正常任务应为 `0`。
 
 | ID | 缺口 | 建议动作 | 调研关键词 | 状态 |
 |----|------|----------|------------|------|
-| E1 | Web 无 Confirm 弹窗 | High 目前一律 Deny；补会话内审批 UX | human in the loop approval UX | [ ] |
-| E2 | exit 0 ≠ 语义成功 | 统一测试摘要解析；未跑到目标测不算绿 | test status parsing, false green | [ ] |
+| E1 | Web 无 Confirm 弹窗 | 会话内审批条 + 时间线 APPROVAL/DENY/EVIDENCE/FAKE_GREEN/DEDUP 气泡 | human in the loop approval UX | [x] |
+| E2 | exit 0 ≠ 语义成功 | 统一测试摘要解析；未跑到目标测不算绿 | test status parsing, false green | [x] |
 | E3 | transient vs strategy 重试未分层清 | API/锁类有限自动重试；策略失败只换策不重放 | retry taxonomy transient semantic | [ ] |
 
 ### 5.3 验收
 
 - Web ASK 下 Medium/High 可点允许/拒绝，拒绝写回 tool 错误且不执行。  
-- 只跑无关命令 exit 0 时，CompletionGate 不得放行「已修复」。
+- 只跑无关命令 exit 0 时，CompletionGate 不得放行「已修复」。  
+- **E2：** `python -m scripts.check_e2`；suite 行 `ver:irrelevant-test-block`；`echo test` / 无关 `*_test.py` 的 exit0 不算绿。
 
 ---
 
-## 6. 结果可验证
+## 6. 结果可验证（Verification）— 调研结论与改造计划
 
-### 6.1 已有（保持）
+> **本章目标：** 回答「Agent 说做完了算不算数」——不是模型自述可信度，而是 **Harness 在任务出口能否：用程序化证据拒绝空口完成、拦住「改测试骗绿」、把 Mustlist 写进 CompletionGate**。  
+> **调研日期：** 2026-08-30。先写计划，再按 §6.6 分阶段落地；勾选见 §6.5 / §6.6。  
+> **与上下游：** §2 `run_tests` / TaskState.`test_status` 已是证据源；§3 病理停 ≠ 假完成；计划书 **17.6～17.8** 为入口/出口双闸叙事。本仓 P1-1 = **V1+V2**。
 
-- `completion_gate.py` / `stop_conditions.py`  
-- 测试全绿 / todo 完成催 FINAL；无证据拒空口完成  
-- TaskState.`test_status` 解析 pytest 类输出
+### 6.0 问题定义：Verification 评什么
 
-### 6.2 缺口与改造方向
+```text
+结果可验证 ≠ 多跑几次 pytest / 多写一句「已验证」
+结果可验证 = 宣称 completed 前 Mustlist 齐备（程序判定，非模型自觉）
+           + 证据种类够：测绿 ≠ 只改了测试文件
+           + 假绿可检出并拒收束（或至少硬告警）
+           + 出口闸与入口 PermissionGate 对称：入口防危害，出口防撒谎
+```
 
-| ID | 缺口 | 建议动作 | 调研关键词 | 状态 |
-|----|------|----------|------------|------|
-| V1 | 证据种类偏窄 | Mustlist：pytest 绿 +（可选）diff 非空 + 目标文件变更 | completion criteria evidence gate | [ ] |
-| V2 | 假绿 / 改测试骗过 | 检测是否改了 `*_test.py` 本身；要求跑到约定用例 | verifiable completion, mustlist | [ ] |
-| V3 | 开放任务缺 acceptance | 任务开始写显式 StopCondition（配置或首轮推断） | stop conditions agent patterns | [ ] |
+**三类失败：**
 
-### 6.3 与计划书
+| 类型 | 含义 | 本仓库例子 |
+|------|------|------------|
+| **Bare complete** | 无 tool 证据就 FINAL | 改完代码直接「修好了」，未 `run_tests` |
+| **Narrow evidence** | 只认 `test_status.passed`，不看改了谁 | 测绿但未触碰目标源文件；diff 空仍可收束 |
+| **Fake green** | 削弱/改写测试使套件变绿 | 只 edit `*_test.py` / `test_*.py`，源码不动 |
 
-- 细节见计划书 **第 17.6～17.8 节**（Verification / Evidence）。
-
-### 6.4 验收
-
-- 模型未跑测就宣称完成 → 被 Gate 拦截并注入「请先跑测试」。  
-- 仅改测试文件使套件变绿 → 应告警或拒绝（若启用 V2）。
+**答辩金句：** 验证质量 = **Mustlist（测绿 × 目标变更）× 假绿防护 × 独立于 LLM 的 CompletionGate**；对照 [Verifiably Safe Tool Use](https://arxiv.org/abs/2601.08012) 四级里的 Mustlist——完成前强制证据流，而不是再 prompt「请诚实」。
 
 ---
+
+### 6.1 资料与对照（精读）
+
+| 来源 | 核心主张 | 我们可偷什么 | 不要照搬 |
+|------|----------|--------------|----------|
+| **[Verifiably Safe Tool Use](https://arxiv.org/abs/2601.08012)** | Blocklist / **Mustlist** / Allowlist / Confirmation；约束由 **独立于 Agent** 的实体执行 | 任务出口 Mustlist；证据不足则拒 Terminate | Alloy 全形式化、MCP 标签协议 |
+| 计划书 **17.6** | 目标文件变更 + 验证命令 + exit0 + 无硬错 | 把「可选 diff / 目标变更」写进 gate | 再开一套 harness 跑测 |
+| OpenHands / SWE-agent 实践 | 以测试/评测脚本为完成标准 | `run_tests` + `test_status` 已有 | 整套评测沙箱 |
+| §3 Anatomy of Termination | Goal 达成须可分类 | `completed` 仅在证据齐或 nudge 耗尽放行 | 重写停因框架 |
+
+**推荐阅读：** 计划书 17.6 → 本文 §6.0 → 对照 `completion_gate.py` / `task_state.py`。
+
+---
+
+### 6.2 可落地方法库
+
+#### M-V1：加宽 Evidence Mustlist
+
+当前：`evidence_satisfied` ≈ `test_status.passed`。加宽为清单（全部程序化）：
+
+| 项 | 判定 | 缺省策略 |
+|----|------|----------|
+| 测试绿 | `test_status.passed is True` | **硬**：缺则拒完成（已有） |
+| 目标/源文件变更 | `mutated_paths` 中存在非测试路径 | **硬**（当本 run 有过写/改且任务像修 bug）：仅测绿不够 |
+| diff 非空 | `mutated_paths` 非空（file_change 已发生）即视为有 diff 证据 | **软/已隐含**：不强制再调 `git_diff` |
+
+#### M-V2：假绿防护（Fake-green）
+
+| 信号 | 判定 |
+|------|------|
+| 仅改测试 | `files_mutated` 且所有 `mutated_paths` 均为测试路径（`*_test.py` / `test_*.py` / `**/tests/**` / `conftest.py`） |
+| 测已绿 | `test_status.passed` |
+
+策略（配置 `FAKE_GREEN_MODE`）：
+
+| 模式 | 行为 |
+|------|------|
+| `block`（默认，evidence 下） | 与缺测证据同：拒完成 + 注入 nudge（计入 `evidence_nudge_max`） |
+| `warn` | 允许完成，但 SSE/`[fake_green]` 告警 + transcript 记一笔 |
+| `off` | 关闭 V2 |
+
+#### M-V3：约定用例（轻量）
+
+- 优先：`run_tests` / pytest 命令字符串与 `relevant_files` / goal 有交集（启发式）。  
+- **本阶段不硬拦**（易误伤「全仓 pytest」）；写入 nudge 文案「请用 run_tests 跑与目标相关的用例」。  
+- 硬白名单属缓做。
+
+---
+
+### 6.3 对照表：业界 vs 本仓库
+
+| 验证原子 | 业界 / 计划书 | 本仓库（改造前） | 差距动作 |
+|----------|---------------|------------------|----------|
+| 无测拒完成 | Mustlist / Evidence Gate | ✅ `completion_gate` | 保持 |
+| 记录改了哪些文件 | file_change / ACI | ✅ Ver-A：`mutated_paths` | — |
+| 源文件须变更 | 目标文件写入成功 | ✅ Ver-A Mustlist | — |
+| 假绿 | 改测试骗过 | ✅ Ver-B：`FAKE_GREEN_MODE` | — |
+| 约定用例 | 评测 harness | 软文案 | V2 轻量；硬名单缓做 |
+| 显式 StopCondition 推断 | V3 | 配置/默认 `tests_all_pass` | **缓做** |
+
+---
+
+### 6.4 已有（保持）
+
+- `completion_gate.py`：`COMPLETION_MODE=evidence` 时无测绿拒收束；`EVIDENCE_NUDGE_MAX` 后放行防卡死  
+- **Ver-A：** `mutated_paths`；Mustlist=测绿 +（有写改时）至少一处非测试源变更  
+- **Ver-B：** `FAKE_GREEN_MODE=block|warn|off`；仅改测试变绿 → 拒完成 / 告警  
+- `stop_conditions.py`：测绿 / todo 催 FINAL；`goal_met_forced` 仅测绿可升级  
+- TaskState.`test_status`（pytest / `run_tests` 解析）  
+- Web/CLI SSE：`completion_gate`（含 fake_green）事件  
+- `scripts/check_ver_a` + smoke 覆盖  
+
+---
+
+### 6.5 缺口与改造项
+
+| ID | 缺口 | 采用方法 | 建议动作 | 状态 |
+|----|------|----------|----------|------|
+| V1 | 证据种类偏窄 | M-V1 | `mutated_paths`；Mustlist=测绿+（有写改时）至少一处非测试源变更；Current State 展示变更分类 | [x] Ver-A |
+| V2 | 假绿 / 改测试骗过 | M-V2, M-V3 | `is_test_path`；仅测文件变更且测绿 → `FAKE_GREEN_MODE=block\|warn\|off`；nudge 文案点名假绿 | [x] Ver-B |
+| V3 | 开放任务缺 acceptance | — | 首轮推断 StopCondition | [ ] 缓做 |
+
+---
+
+### 6.6 实施计划（按此执行）
+
+```text
+阶段 Ver-A（≈0.5 天）— Mustlist 加宽
+  1. TaskState.mutated_paths + note_mutation；write/edit 成功时写入
+  2. evidence_satisfied / should_block：测绿 + 有写改时须有非测试路径
+  3. Current State / nudge 文案暴露「已改：源/测」
+  4. 冒烟：无测拒完成（回归）；有源变更+测绿放行
+
+阶段 Ver-B（≈0.5 天）— 假绿防护
+  1. FAKE_GREEN_MODE（默认 block）
+  2. 仅改测试 + 测绿 → block/warn；reason=fake_green
+  3. check_ver_a + smoke 用例；文档勾选 P1-1
+```
+
+**依赖与边界：**
+
+- 检测放在 **completion 边界**（与现 Gate 同层），不靠 prompt。  
+- `trust_model` / `off` 关闭 Mustlist 与假绿硬拦。  
+- 无任何写改、仅「跑测确认」类任务：不要求源变更（无 `files_mutated` 时沿用原「coding goal → 要测绿」逻辑）。  
+- 不引入第二模型当 verifier；不强制 `git_diff` 工具调用。
+
+---
+
+### 6.7 验收标准（Definition of Done）
+
+- [x] Ver-A：未跑测宣称完成 → Gate 拦截并注入催测（回归）。  
+- [x] Ver-A：源文件有变更 + 测绿 → 允许完成。  
+- [x] Ver-B：仅改 `*_test.py` 等使套件变绿 → `block` 下拒完成（或 `warn` 下告警可观测）。  
+- [x] `python -m scripts.check_ver_a` + `smoke_v1` 覆盖上述路径。  
+
+**本章不做完不算验证升级；仅有「请先跑测试」软文案、不拦假绿 → 仍算 Narrow evidence / Fake green 风险。**
+
+#### 验证维如何测试
+
+**离线（无 API，必跑）**
+
+```powershell
+conda activate codeagent
+cd G:\codeagent
+python -m scripts.check_ver_a
+python -m scripts.smoke_v1
+```
+
+**Web（可选）**  
+修 greeter：时间线应出现 `run_tests` 绿后才 FINAL；若只改测试文件，应见 `[completion_gate]` / fake_green 拦截。
+
+### 6.8 与计划书
+
+- 细节见计划书 **第 17.6～17.8 节**；论文：[Verifiably Safe Tool Use](https://arxiv.org/abs/2601.08012)。
+
+---
+
 
 ## 7. 成本可控（Cost）— 调研结论与改造计划
 
@@ -761,7 +901,7 @@ Budget: steps 3/12 | tokens ≈ 18k/50k (36%) | level=ok|warn|critical
 |----|------|----------|
 | L0 硬闸 | M-$1/$2 | **Cost-A 必做** |
 | L1 少步 | 批工具、Search-first、病理 BLOCK、粗 todo | **已大部分落地**（§2/§3/计划书15）；Cost 只验收不重复造 |
-| L2 瘦窗 | 截断、可见集、auto-head、soft-dedup | 已有 + X3 待做 |
+| L2 瘦窗 | 截断、可见集、auto-head、soft-dedup | 已有（含 **X3 soft-dedup**） |
 | L3 缓存 | 稳定 system 前缀 + cache hint | **保持**；测 hit 属加分 |
 | L4 路由/级联 | FrugalGPT / RouteLLM / 三档模型 | **缓做**；验收用 pytest 当 verifier 叙事 |
 | L5 树搜索 | BAVT | **不做** |
@@ -913,53 +1053,241 @@ JSON 默认：`evals/results/cost_live_*.json`。
 ---
 
 
-## 8. 安全可控
+## 8. 安全可控（Security）— 调研结论与改造计划
 
-### 8.1 已有（保持）
+> **本章目标：** 回答「危险动作能不能被拦住」——不是模型更听话，而是 **Harness 在 dispatch 前能否：对网络/安装独立分级、堵住常见子进程读密绕过、把残余风险写进文档**。  
+> **调研日期：** 2026-08-30。先写计划，再按 §8.6 落地；勾选见 §8.5 / §8.6。  
+> **与上下游：** 计划书 **17.4～17.5**；入口 PermissionGate ↔ 出口 CompletionGate（§6）。P1-2 = **S2+S3**；S1 OS 沙箱 / S4 IFC **缓做**。
 
-- 工作目录路径沙箱；shell hard-deny；`--approval auto|ask|never`  
-- `risk_level` / `is_readonly`；敏感路径 Deny  
-- Least Privilege 可见集；Web 上 High Deny；Completion 出口证据
+### 8.0 问题定义：Security 评什么
 
-### 8.2 缺口与改造方向
+```text
+安全可控 ≠ 多几句「请勿删库」prompt
+安全可控 = 危险工具调用在 authorize 边界可 Deny/Confirm
+           + 网络/安装有独立策略（非模糊 medium）
+           + 常见「用 shell 读 .env」绕过被拦
+           + 已知绕不过的点写明（子进程盲读 / 无 OS 沙箱）
+```
 
-| ID | 缺口 | 建议动作 | 调研关键词 | 状态 |
-|----|------|----------|------------|------|
-| S1 | 无 OS 级沙箱 | Windows 先承认局限；可查 WSL/bubblewrap 或子进程环境剥离 | coding agent sandbox, Claude Code sandbox | [ ] 缓做 |
-| S2 | 网络 / pip 无独立策略 | 升 High 或独立 allowlist；勿只靠模糊字符串 | network policy agent tools, pip install risk | [ ] |
-| S3 | 子进程可读敏感文件 | 拦 `python -c`/`Get-Content` 等常见读法；文档写明残余风险 | sensitive files subprocess bypass | [ ] |
-| S4 | 无链式 IFC / 注入专项 | 读不可信内容后限制写/外传；间接 prompt injection | AgenTRIM, ASI02, prompt injection agent | [ ] 缓做 |
+**三类失败：**
 
-### 8.3 与计划书
+| 类型 | 含义 | 本仓库例子 |
+|------|------|------------|
+| **Unscoped network** | pip/curl 与普通 pytest 同级 Medium | `pip install evil` 在 auto 下静默跑 |
+| **Subprocess bypass** | `read_file .env` 拒了，但 `python -c open('.env')` 放行 | 字符串未覆盖解释器读密 |
+| **False assurance** | 假装 OS 沙箱已有 | Windows 无 bubblewrap；需文档诚实 |
 
-- 细节见计划书 **第 17 节**；论文：[AgenTRIM](https://arxiv.org/abs/2601.12449)、[Verifiably Safe Tool Use](https://arxiv.org/abs/2601.08012)。
-
-### 8.4 验收
-
-- 冒烟：读 `.env`、`git reset --hard`、正常 pytest → Deny / Deny或Confirm / Allow。  
-- 新增网络/pip 策略后有对应用例。
+**答辩金句：** 安全质量 = **Blocklist（hard-deny/敏感）× 参数级升风险（网络/pip→High）× 子进程读密启发式 × 已知局限披露**；对照 AgenTRIM「收紧高风险暴露」与 Claude Code Permissions。
 
 ---
 
-## 9. 持续改进
+### 8.1 资料与对照
+
+| 来源 | 可偷 | 不照搬 |
+|------|------|--------|
+| [AgenTRIM](https://arxiv.org/abs/2601.12449) | 高风险工具少暴露；参数再校验 | 自动 extractor |
+| 计划书 17.4 / Claude Permissions | allow/ask/deny；pip/网络升 High | 完整规则 DSL |
+| [agentpatterns sensitive files](https://agentpatterns.ai/security/protecting-sensitive-files/) | deny Read/Edit；子进程需命令识别 | 声称穷尽所有绕过 |
+| Verifiably Safe Tool Use | Blocklist 独立于 Agent | Alloy / MCP 标签 |
+
+---
+
+### 8.2 可落地方法
+
+#### M-S2：网络 / 安装独立策略
+
+| 检测（命令启发式） | 默认动作 |
+|--------------------|----------|
+| `pip install` / `python -m pip install` / `uv pip install` | 升 **High** 或 **Deny** |
+| `npm/yarn/pnpm install|add`、`poetry add` | 同上 |
+| `curl` / `wget` / `Invoke-WebRequest` / `Invoke-RestMethod` / `iwr`（含已有 `curl\|sh`） | 同上 |
+
+配置 `NETWORK_POLICY`：
+
+| 值 | 语义 |
+|----|------|
+| `high`（默认） | 命中 → risk=High（ask/never/deny_high 生效；auto 仍 Allow 除非 deny_high） |
+| `deny` | 命中 → 硬 Deny（reason 标明 network/install policy） |
+| `allow` | 不因此升 High（回归旧行为；其它 hard-deny 仍在） |
+
+#### M-S3：子进程敏感读缓解
+
+在现有 `cat`/`type`/`Get-Content` 之外，拦常见解释器读密：
+
+| 模式 | 例 |
+|------|-----|
+| `python/py/python3 -c` 且命令串含敏感名 | `python -c "open('.env').read()"` |
+| `node -e` / `nodejs -e` 同上 | `node -e "fs.readFileSync('.env')"` |
+| PowerShell `-Command`/`-c` + Get-Content/gc/type / 敏感名 | 已有 gc + 扩展 |
+| `head`/`tail`/`less`/`more` + 敏感路径 | 补 shell 读模式 |
+
+**残余风险（必须写入 README）：** 编码混淆、间接路径、自写脚本读密等 **无法靠字符串穷举**；完整防护需 OS 沙箱（S1 缓做）。
+
+---
+
+### 8.3 对照表
+
+| 安全原子 | 计划书 / 业界 | 改造前 | 差距动作 |
+|----------|---------------|--------|----------|
+| 路径沙箱 | workdir | ✅ | 保持 |
+| hard-deny / High shell | rm/reset/force | ✅ | 保持 |
+| 敏感路径工具 Deny | .env / keys | ✅ | 保持 |
+| cat/type 读密 | shell 参数 | ✅ Sec-B 加宽 head/tail/解释器 | — |
+| pip/网络独立策略 | High 或 deny | ✅ Sec-A：`NETWORK_POLICY` | — |
+| OS 沙箱 | bubblewrap | ❌ | S1 缓做 |
+| IFC / 注入 | 链式 | ❌ | S4 缓做 |
+
+---
+
+### 8.4 已有（保持）
+
+- 工作目录路径沙箱；shell hard-deny；`--approval auto|ask|never`  
+- `risk_level` / `is_readonly`；敏感路径 Deny（read/write/edit + cat/type/Get-Content）  
+- **Sec-A：** `NETWORK_POLICY=high|deny|allow`（pip/npm/curl 等）  
+- **Sec-B：** `python -c` / `node -e` / `head|tail` 等子进程读密启发式 Deny  
+- Least Privilege 可见集；Web 上 High Deny；Completion 出口证据  
+- `scripts/check_sec_a` + smoke；README 残余风险说明  
+
+---
+
+### 8.5 缺口与改造项
+
+| ID | 缺口 | 采用方法 | 建议动作 | 状态 |
+|----|------|----------|----------|------|
+| S1 | 无 OS 级沙箱 | — | 文档承认；WSL/bubblewrap 缓做 | [ ] 缓做 |
+| S2 | 网络 / pip 无独立策略 | M-S2 | `NETWORK_POLICY`；pip/npm/curl 等 → high/deny | [x] Sec-A |
+| S3 | 子进程可读敏感文件 | M-S3 | python -c / node -e / head|tail + 敏感名 Deny；README 残余风险 | [x] Sec-B |
+| S4 | 无链式 IFC | — | 缓做 | [ ] 缓做 |
+
+---
+
+### 8.6 实施计划
+
+```text
+阶段 Sec-A（≈0.3 天）— S2 网络/安装
+  1. assess_shell_risk：识别 install/network 模式
+  2. NETWORK_POLICY=high|deny|allow（默认 high）接入 Config + Gate
+  3. 冒烟：pip install / curl → High 或 Deny；pytest 仍 Medium/Allow
+
+阶段 Sec-B（≈0.3 天）— S3 子进程读密
+  1. 扩展 shell 读模式 + 解释器 -c/-e 含敏感 basename → Deny
+  2. check_sec_a + smoke；README 写明残余风险
+```
+
+**边界：** 检测只在 `PermissionGate.assess_risk` / `assess_shell_risk`；不散落 handler。不引入 OS 沙箱。误伤：本地 `pip install -e .` 在 `high`+`deny_high`（Web）下会被拒——可接受；CLI auto 下仍需用户 ask/never 才拦。
+
+---
+
+### 8.7 验收标准
+
+- [x] 读 `.env`、`git reset --hard`、正常 pytest → Deny / Deny或Confirm / Allow（回归）。  
+- [x] `pip install requests`：`NETWORK_POLICY=deny` → Deny；`high` → risk=High。  
+- [x] `python -c "print(open('.env').read())"` → Deny。  
+- [x] `python -m scripts.check_sec_a` + `smoke_v1` 通过。  
+
+#### 安全维如何测试
+
+```powershell
+conda activate codeagent
+cd G:\codeagent
+python -m scripts.check_sec_a
+python -m scripts.smoke_v1
+```
+
+### 8.8 与计划书
+
+- 细节见计划书 **第 17 节**；论文：[AgenTRIM](https://arxiv.org/abs/2601.12449)、[Verifiably Safe Tool Use](https://arxiv.org/abs/2601.08012)。
+
+---
+
+## 9. 持续改进（Improvement）— 调研结论与改造计划
+
+> **本章目标：** 回答「改护栏有没有变好」——不是感觉更好，而是 **同一批固定任务能否一条命令出表：完成率 / 步数 / 违规率 / 病理，并进冒烟**。  
+> **调研日期：** 2026-08-30。P1-3 = **I1**；I2 人工回流 / I3 A/B **缓做或后续**。  
+> **与上下游：** Cap-C / Dec-C / Cost-C / Ver / Sec 已有分维 eval；I1 把它们收成 **统一套件入口**，避免「改完只跑自己那一维」。
+
+### 9.0 问题定义
+
+```text
+持续改进 ≠ 多写进度日志 / 多跑几次 smoke
+持续改进 = 固定任务集 + 可比指标（完成/步数/违规/转圈）
+           + 一条命令出表
+           + 合并前至少跑 offline 套件（或冒烟已挂载）
+```
+
+| 类型 | 含义 | 本仓库 |
+|------|------|--------|
+| **No baseline** | 改前后无法比 | 分维脚本散落，无统一表 |
+| **Anecdote** | 「感觉少转圈了」 | 无 pathology/violation 汇总 |
+| **Silent regress** | 修 Cost 弄坏 Cap | 未跑全套 |
+
+**答辩金句：** 改进质量 = **固定 eval 轨迹 × 统一 KPI 表 × 合并前门禁**；对照 trajectory eval / CORE-TRACE 简化版。
+
+---
 
 ### 9.1 已有（保持）
 
-- transcript JSON；`scripts/smoke_v1`；计划书进度日志  
+- transcript JSON；`scripts/smoke_v1`  
+- `run_capability_eval` / `run_decision_eval` / `run_cost_eval`（分维）  
+- `check_ver_a` / `check_sec_a`  
+- **Imp-A：** `evals/suite.py` + `scripts/run_suite_eval.py`（统一表 + KPI）  
 - 单次 run 内 failed strategies（TaskState）
 
-### 9.2 缺口与改造方向
+---
 
-| ID | 缺口 | 建议动作 | 调研关键词 | 状态 |
-|----|------|----------|------------|------|
-| I1 | 无固定任务 eval 集 | 建 `evals/`：greeter 等；指标=完成率/步数/违规/是否转圈 | agent eval harness, trajectory eval | [ ] |
-| I2 | 失败不回流到 Skill/阈值 | 人工复盘表：失败类型 → 改 Guard 阈值或 Skill 步骤 | agent error analysis loop | [ ] |
-| I3 | 改护栏无 A/B | 同一 eval 集对比 warn/stop 阈值误伤率 | prompt/threshold ab test agent | [ ] 缓做 |
+### 9.2 方法 M-I1：统一 Suite Eval
 
-### 9.3 验收
+| 产出 | 说明 |
+|------|------|
+| 入口 | `python -m scripts.run_suite_eval --offline`（必跑）/ `--live`（可选 API） |
+| 行 | `dim \| task \| ok \| completed \| steps \| violated \| pathology \| stopped` |
+| 汇总 | `ok_rate` / `completed_rate` / `violation_rate` / `pathology_rate` / `avg_steps` |
+| 维度来源 | Cap offline + Dec offline + Cost offline + Ver 用例 + Sec 用例 |
+| live | 复用 Cap live 任务行（locate/fix-greeter）写入同一表形 |
 
-- 一条命令跑完 eval，输出表格：任务、stopped_reason、steps、是否完成、是否违规。  
-- 任何 D1/$1/V1 等改动合并前必须跑 eval 或至少冒烟扩展。
+**违规 `violated`：** 期望 Deny 却 Allow、或假绿/预算误杀等「护栏失效」类失败；正常 Deny 敏感路径 **不算**违规。
+
+---
+
+### 9.3 缺口与改造项
+
+| ID | 缺口 | 建议动作 | 状态 |
+|----|------|----------|------|
+| I1 | 无固定任务统一 eval 集 | `evals/suite.py` + `run_suite_eval`；smoke 挂 offline | [x] Imp-A |
+| I2 | 失败不回流 Skill/阈值 | 人工复盘表 | [ ] 缓做 |
+| I3 | 改护栏无 A/B | 同套件比阈值 | [ ] 缓做 |
+
+---
+
+### 9.4 实施计划（Imp-A）
+
+```text
+1. SuiteRow + 汇总 KPI；适配现有 Cap/Dec/Cost offline 报告
+2. 嵌入 Ver/Sec 关键用例为 suite 行
+3. scripts/run_suite_eval.py --offline|--live；JSON 可写 evals/results/
+4. smoke_v1 调用 suite offline（或等价 all-ok）
+5. 文档勾选 P1-3；README 一条命令
+```
+
+---
+
+### 9.5 验收标准
+
+- [x] `python -m scripts.run_suite_eval --offline` 出表且全行 `ok=Y`。  
+- [x] 表含：任务、stopped_reason、steps、是否完成、是否违规（及 dim/pathology）。  
+- [x] 汇总打印完成率 / 违规率等；smoke 已挂。  
+
+```powershell
+conda activate codeagent
+cd G:\codeagent
+python -m scripts.run_suite_eval --offline
+python -m scripts.smoke_v1
+```
+
+### 9.6 与分维关系
+
+- Cap/Dec/Cost 脚本 **保留**；suite 是聚合门禁。  
+- live 基线仍可分维写入 §13；suite `--live` 便于答辩一键演示。
 
 ---
 
@@ -972,12 +1300,15 @@ JSON 默认：`evals/results/cost_live_*.json`。
 | **P0-1** | D1 周期/停滞检测 + D3 dispatch 硬 BLOCK（§3 Dec-A） | 决策 + 成本 | 1 天 | [x] Dec-A（D2 停滞属 Dec-B） |
 | **P0-2** | Capability Cap-A/B/C（已完成；live 基线用 `--live` 回填） | 能力 + 成本 + 上下文 | — | [x] |
 | **P0-3** | $1 任务级 token 硬闸 + $3/$4 账单与预算可见（§7 Cost-A/B/C） | 成本 | 1～1.5 天 | [x] Cost-A/B/C |
-| **P1-1** | V1 加宽 Evidence Mustlist + V2 假绿防护 | 结果可验证 | 0.5～1 天 | [ ] |
-| **P1-2** | S2 网络/安装策略 + S3 子进程敏感读缓解 | 安全 | 0.5～1 天 | [ ] |
-| **P1-3** | I1 固定任务 eval 集（步数/完成率/违规率） | 持续改进 | 1 天 | [ ] |
+| **P1-1** | V1 加宽 Evidence Mustlist + V2 假绿防护 | 结果可验证 | 0.5～1 天 | [x] Ver-A/B |
+| **P1-2** | S2 网络/安装策略 + S3 子进程敏感读缓解 | 安全 | 0.5～1 天 | [x] Sec-A/B |
+| **P1-3** | I1 固定任务 eval 集（步数/完成率/违规率） | 持续改进 | 1 天 | [x] Imp-A |
 
 **缓做（答辩可提「下一步」）：** C4 子 Agent、D5 向量 Router、S1 OS 沙箱、S4 IFC、I3 A/B；层级规划（ReAcTree/ReCAP）仅作下一步叙事。
 
+**Improvement 专序：** 见 **§9.4**（Imp-A），与上表 P1-3 对齐。  
+**Security 专序：** 见 **§8.6**（Sec-A → Sec-B），与上表 P1-2 对齐。  
+**Verification 专序：** 见 **§6.6**（Ver-A → Ver-B），与上表 P1-1 对齐。  
 **Capability 专序：** 见 **§2.6**（Cap-A → Cap-B → Cap-C），与上表 P0-2 对齐。  
 **Decision 专序：** 见 **§3.6**（Dec-A → Dec-B → Dec-C），与上表 P0-1 对齐。  
 **Cost 专序：** 见 **§7.6**（Cost-A → Cost-B → Cost-C），与上表 P0-3 对齐。
@@ -992,9 +1323,10 @@ JSON 默认：`evals/results/cost_live_*.json`。
 | **Decision（§3）** | [OpenHands StuckDetector](https://docs.openhands.dev/sdk/guides/agent-stuck-detector)；[AWS Debounce](https://dev.to/aws/how-to-prevent-ai-agent-reasoning-loops-from-wasting-tokens-2652)；[Anatomy of Termination](https://towardsai.com/p/machine-learning/when-should-an-agent-stop-the-anatomy-of-termination)；本文 §3；**验收** `python -m scripts.run_decision_eval --offline` |
 | **Cost（§7）** | 本文 §7；**验收** `python -m scripts.run_cost_eval --offline`；live：`python -m scripts.run_cost_eval --live` |
 | X3 soft-dedup | Kimi tool-dedup；计划书 15.6；与 C6 大文件默认头 N 行配合 |
-| V1/V2 | 计划书 17.6；[Verifiably Safe Tool Use](https://arxiv.org/abs/2601.08012) |
-| S2/S3 | 计划书 17.4～17.5；[AgenTRIM](https://arxiv.org/abs/2601.12449)；Claude Code Permissions |
-| I1 / C7 | Agent eval / trajectory；本仓 `demos/` + transcript；CORE/TRACE 思路简化版 |
+| X1 压缩抽检 | 本文 §4；**验收** `python -m scripts.check_x1` / `run_context_eval --offline` |
+| V1/V2 | 本文 §6；计划书 17.6；**验收** `python -m scripts.check_ver_a`；[Verifiably Safe Tool Use](https://arxiv.org/abs/2601.08012) |
+| S2/S3 | 本文 §8；**验收** `python -m scripts.check_sec_a`；计划书 17.4～17.5；[AgenTRIM](https://arxiv.org/abs/2601.12449) |
+| I1 / C7 | 本文 §9；**验收** `python -m scripts.run_suite_eval --offline`；分维 Cap/Dec/Cost 仍可用 |
 
 ---
 
@@ -1029,6 +1361,15 @@ JSON 默认：`evals/results/cost_live_*.json`。
 | 2026-08-30 | **Cost-B 落地**（$3/$4） | Current State `Budget:` 行；≤20% 一次性 `[budget_warn]`；`cost_report`（steps/tokens/tool_counts）→ memory+transcript+Web FINAL/顶栏；SSE `task_budget`/`cost_report`/`budget_warn` |
 | 2026-08-30 | **Cost-C 落地**（$7） | `evals/cost.py` + `run_cost_eval --offline` 五行；smoke 挂载；**live** `cost_live_20260830_210626.json`：fix-greeter **steps=5，tok≈26926，tools=7，completed**；`--low-budget 8000` → **budget_exhausted early@2** |
 | 2026-08-30 | **Cost-C live 复跑**（`cost_live_20260830_210807.json`） | fix-greeter：**steps=5，tok≈27274，tools=7，completed**（in≈26k/out≈944）；`--low-budget 8000`：**steps=2，tok≈9561，budget_exhausted early=Y**（与首跑同量级） |
+| 2026-08-30 | **④ 验证维调研 + 方法计划写入 §6** | 定案 M-V1～M-V3；对照 Mustlist / 假绿；实施序 Ver-A/B；主缺口 V1 源变更证据、V2 假绿 |
+| 2026-08-30 | **Ver-A/B 落地**（V1/V2，P1-1） | `mutated_paths` + Mustlist（测绿+源变更）；`FAKE_GREEN_MODE=block\|warn\|off`；`check_ver_a` + smoke；Current State 展示 Mutated source/tests |
+| 2026-08-30 | **⑤ 安全维调研 + 方法计划写入 §8** | 定案 M-S2/M-S3；`NETWORK_POLICY`；子进程读密启发式；S1/S4 缓做 |
+| 2026-08-30 | **Sec-A/B 落地**（S2/S3，P1-2） | pip/npm/curl→High或deny；`python -c`/`node -e`/`head` 读密 Deny；`check_sec_a` + smoke；README 残余风险 |
+| 2026-08-30 | **⑥ 持续改进调研 + Imp-A 计划写入 §9** | 定案 M-I1 统一套件；分维脚本保留；I2/I3 缓做 |
+| 2026-08-30 | **Imp-A 落地**（I1，P1-3） | `evals/suite.py` + `run_suite_eval --offline`：19 行全 Y；KPI 完成率/违规率/病理率；smoke 挂载；**六项优先改造全部勾完** |
+| 2026-08-30 | **Web 护栏可见 + X3 + live 复跑** | 时间线 EVIDENCE/FAKE_GREEN/DENY/APPROVAL/DEDUP 气泡；审批条 High 提示；`read_file` soft-dedup；**live** `live_post_p1_20260830.json`：locate **steps=5** ok+grep；fix-greeter **steps=5** ok+run_tests（较初基线 locate 同阶、fix 5→5 持平） |
+| 2026-08-30 | **E2 落地**（语义测绿） | 收紧 `looks_like_test_command`；`TestStatus.targets`；`test_run_covers_task` / `semantic_tests_passed`；无关 `run_tests other_test` exit0 → `irrelevant_test_run`；`check_e2` + suite `ver:irrelevant-test-block`；stop_condition 同步语义绿 |
+| 2026-08-30 | **X1 落地**（压缩抽检 eval） | `evals/context.py`：obs/state/fold/microcompact 四 fixture；`check_x1` + `run_context_eval --offline`；suite `context:*` 行；关键路径+AssertionError/FAILED 压缩后须保留 |
 |  |  |  |
 
 ---

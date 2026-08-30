@@ -35,6 +35,10 @@ class Config:
     tool_visibility: str = "auto"  # auto | off
     completion_mode: str = "evidence"  # evidence | trust_model
     evidence_nudge_max: int = 2
+    # Ver-B: block | warn | off — only-test mutations + green tests
+    fake_green_mode: str = "block"
+    # Sec-A: high | deny | allow — pip/npm/curl risk policy
+    network_policy: str = "high"
     deny_high: bool = False
 
     @classmethod
@@ -177,6 +181,14 @@ class Config:
         if evidence_max < 1:
             raise ValueError("EVIDENCE_NUDGE_MAX must be >= 1")
 
+        fake_green = (os.getenv("FAKE_GREEN_MODE") or "block").strip().lower()
+        if fake_green not in {"block", "warn", "off"}:
+            fake_green = "block"
+
+        network_policy = (os.getenv("NETWORK_POLICY") or "high").strip().lower()
+        if network_policy not in {"high", "deny", "allow"}:
+            network_policy = "high"
+
         deny_high_env = (os.getenv("DENY_HIGH") or "").strip().lower()
         deny_high = deny_high_env in {"1", "true", "yes", "on"}
 
@@ -201,5 +213,7 @@ class Config:
             tool_visibility=visibility,
             completion_mode=completion,
             evidence_nudge_max=evidence_max,
+            fake_green_mode=fake_green,
+            network_policy=network_policy,
             deny_high=deny_high,
         )

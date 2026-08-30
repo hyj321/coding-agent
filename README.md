@@ -21,8 +21,12 @@
 - Skills：渐进披露（目录常驻 + `load_skill` / 关键词预注入），见 `skills/{debugging,testing,refactoring}/`
 - 路径沙箱 + `--approval auto|ask|never`
 - **三级风险元数据**（`risk_level` / `is_readonly`）：Low 自动放行；Medium/High 受 approval 约束；`.env` / SSH Key 等敏感路径 **始终 Deny**
-- **Least Privilege 可见集**（`TOOL_VISIBILITY=auto`）：按 todo 阶段收窄本步工具；**Completion Evidence**：改文件后无测试绿不准宣称完成
-- Web 默认 **High Deny**（无确认框时不放行高危 shell）
+- **网络/安装策略**（`NETWORK_POLICY=high|deny|allow`）：`pip`/`npm`/`curl` 等默认升 High；`deny` 时硬拒
+- **子进程读密缓解**：拦 `cat`/`head`/`python -c`/`node -e` 等常见读 `.env` 绕过（**非** OS 沙箱；残余风险见下）
+- **Least Privilege 可见集**（`TOOL_VISIBILITY=auto`）：按 todo 阶段收窄本步工具；**Completion Evidence Mustlist**：测绿 +（有写改时）源文件变更；**假绿防护**（`FAKE_GREEN_MODE=block|warn|off`）拒「只改测试变绿」
+- **Web 护栏可见**：时间线气泡 EVIDENCE / FAKE_GREEN / DENY / APPROVAL / DEDUP；Medium/High 底部审批条
+- **X3 soft-dedup**：同路径 `read_file` 且 mtime 未变 → 回摘要，不重复灌全文
+- Web 交互审批（`approval=ask`）；敏感路径始终 Deny；无审批桥时 High 可 `deny_high`
 - 上下文裁剪（`MAX_MESSAGES`）+ 工具输出截断
 - **ACON 简化版 Context Manager**：分层上下文 + pytest 等观测压缩 + 超预算历史摘要折叠（`CONTEXT_TOKEN_BUDGET`）
 - **长短期记忆（P0–P2）**：MEMORY.md、working_memory、续写瘦身、前缀/后缀布局、折叠重注、MicroCompact、失败对更新压缩 guideline、本地 TF–IDF `rag_search`、prompt-cache 钩子
@@ -64,6 +68,7 @@ python -m src.web
 - **左侧栏固定**：不随中间区滚动；**Recent chats** 独立滚动；**一整轮对话 = 一条 session 历史**（多轮续写：喂模型用 memory + 最近 K，磁盘保留完整 messages）
 - **Open folder**：顶部打开文件夹 → 更新 Workdir；右侧 **Files** 树可浏览，点击文件新窗口打开
 - **Changed files**：`write_file` / `edit_file` 后底部列出改动，点击查看新旧对比
+- **护栏气泡**：完成证据不足 / 假绿 / 权限拒绝 / soft-dedup 会在时间线以彩色 INFO 标签出现；High 工具弹出底部审批条
 - **Plan 面板**：随 `todo_write` 实时勾选（右侧 Files / Plan 可切换、可折叠）
 - 侧栏 **Reset demos**：把 `greeter.py` / `buggy_calc.py` 恢复为有意 bug
 - 同时只允许一个任务运行（第二个返回 409）
@@ -96,7 +101,8 @@ Agent Loop (src/agent/loop.py)
 1. **模型只出意图，副作用在本地**——工具结果必须写回 messages，模型才能感知。
 2. **新工具 = 注册表加一项**，主循环不必改。
 3. **Todo 是一等工具**，不是另起一套框架；规划与执行仍在同一 loop 里。
-4. **安全在工具边界执行**：`PermissionGate` 读 Registry 元数据 + 参数启发式（敏感路径 / 危险 shell），不依赖模型「保证遵守」。
+4. **安全在工具边界执行**：`PermissionGate` 读 Registry 元数据 + 参数启发式（敏感路径 / 危险 shell / 网络安装 / 解释器读密），不依赖模型「保证遵守」。  
+   **已知局限：** Windows 无 OS 级沙箱；编码混淆、间接脚本读密等无法靠字符串穷举——演示请用 `read_file .env` / `python -c open('.env')` 等常见路径。
 5. **完成靠证据**：Harness 用测试 exit code / `run_tests` 决定能否 Terminate；模型自述「已修好」不够。
 
 ## Capability 边界（会做什么 / 不做什么）
@@ -106,6 +112,18 @@ Agent Loop (src/agent/loop.py)
 **不做（刻意）：** 浏览器 / 外网检索、MCP、LSP 跳转、多子 Agent 并行、OS 级沙箱（仅路径沙箱）、自动 `git commit/push`。
 
 更多质量标准与改造序见 [`Agent质量标准与改进路线.md`](./Agent质量标准与改进路线.md)。
+
+## 统一 Eval 套件（Imp-A / I1，合并前门禁）
+
+一条命令跑完 Cap + Dec + Cost + Ver + Sec 离线用例，输出统一表与 KPI：
+
+```powershell
+python -m scripts.run_suite_eval --offline
+# 可选 live（需 API，Capability 任务）：
+python -m scripts.run_suite_eval --live
+```
+
+表列：`dim | task | ok | done | steps | viol | patho | stopped`；汇总含完成率 / 违规率 / 病理率 / avg_steps。
 
 ## Capability Eval（Cap-C）
 
@@ -141,6 +159,9 @@ Live 结果写入 `evals/results/cost_live_*.json`（`tokens_total_est` / 低压
 | `--approval` | `auto` / `ask` / `never`（Low 始终放行；Medium/High 受此约束；敏感路径与 hard-deny 始终拒绝） |
 | `TOOL_VISIBILITY` | `auto`（按阶段收窄工具）/ `off`（全量） |
 | `COMPLETION_MODE` | `evidence`（默认，改代码需测试证据）/ `trust_model` |
+| `EVIDENCE_NUDGE_MAX` | 证据催促次数上限（默认 2，耗尽后放行防卡死） |
+| `FAKE_GREEN_MODE` | `block`（默认）/ `warn` / `off`：仅改测试文件却测绿时的处理 |
+| `NETWORK_POLICY` | `high`（默认，pip/npm/curl 升 High）/ `deny`（硬拒）/ `allow`（不因此升级） |
 | `DENY_HIGH` | `true` 时 High 在 auto 下也拒绝（Web 默认开启） |
 | `--max-steps` / `--max-messages` | 循环与上下文上限 |
 | `--context-budget` / `CONTEXT_TOKEN_BUDGET` | Context Manager 近似 token 预算（默认 **32000**） |

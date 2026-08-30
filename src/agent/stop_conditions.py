@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from src.agent.task_state import TaskState
+from src.agent.task_state import TaskState, semantic_tests_passed
 
 FINAL_NUDGE_MARKER = "[stop_condition]"
 _MUTATING_TOOLS = frozenset({"write_file", "edit_file", "run_shell"})
@@ -51,11 +51,9 @@ def evaluate_final_nudge(
 ) -> tuple[bool, list[str]]:
     """Return (should_nudge, reasons)."""
     reasons: list[str] = []
-    ts = task_state.test_status
     if (
         task_state.stop_condition in {"tests_all_pass", "tests_or_todo"}
-        and ts is not None
-        and ts.passed is True
+        and semantic_tests_passed(task_state)
     ):
         reasons.append("tests_all_pass")
     if todos_all_completed(todos_text) and not step_had_failure:
@@ -72,7 +70,7 @@ def reasons_allow_force_stop(reasons: list[str]) -> bool:
 def build_final_nudge_message(reasons: list[str], *, task_state: TaskState) -> str:
     bits = ", ".join(reasons) if reasons else "goal"
     extra = ""
-    if task_state.test_status and task_state.test_status.passed:
+    if semantic_tests_passed(task_state) and task_state.test_status:
         extra = f"\n测试摘要：{task_state.test_status.summary}"
 
     if reasons_allow_force_stop(reasons):
@@ -122,10 +120,18 @@ def force_stop_message(reasons: list[str]) -> str:
 
 
 def clear_nudge_state(task_state: TaskState) -> None:
-    """Call at the start of each user turn so follow-ups can keep editing."""
+    """Call at the start of each user turn so follow-ups can keep editing.
+
+    Also clears prior-turn verification evidence: hydrated working_memory may still
+    carry ``test_status.passed=True`` from an earlier fix, which would wrongly
+    satisfy CompletionGate on a bare \"I'm done\" claim.
+    """
     task_state.final_nudge_sent = False
     task_state.stop_nudge_reasons = []
     task_state.evidence_nudge_count = 0
+    task_state.test_status = None
+    task_state.files_mutated = False
+    task_state.mutated_paths = []
 
 def stop_reasons_from_memory(memory: dict[str, Any] | None) -> list[str]:
     if not isinstance(memory, dict):

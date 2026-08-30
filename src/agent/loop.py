@@ -10,6 +10,8 @@ from typing import Any, Callable
 
 from src.agent.completion_gate import (
     build_evidence_nudge_message,
+    fake_green_warn_payload,
+    is_fake_green,
     note_completion_nudge,
     should_block_completion,
 )
@@ -303,9 +305,10 @@ def run_agent(
 
     messages = sanitize_tool_pairing(messages)
     if ctx is not None:
-        ctx.ensure_task_goal(user_task)
+        # Latest user message defines the active goal (do not keep stale WM goal)
+        ctx.ensure_task_goal(user_task, replace=True)
         # Each new user message may ask for more edits — never inherit a stale
-        # "already nudged / force-stop" latch from a previous turn.
+        # "already nudged / force-stop / tests green" latch from a previous turn.
         clear_nudge_state(ctx.task_state)
         ctx.post_nudge_mutating = 0
     tools = registry.openai_tools()  # may be narrowed each step when visibility=auto
@@ -321,6 +324,7 @@ def run_agent(
     tool_visibility = str(getattr(cfg, "tool_visibility", "auto") or "auto")
     completion_mode = str(getattr(cfg, "completion_mode", "evidence") or "evidence")
     evidence_nudge_max = int(getattr(cfg, "evidence_nudge_max", 2) or 2)
+    fake_green_mode = str(getattr(cfg, "fake_green_mode", "block") or "block")
     task_tok_cap = (
         int(max_task_tokens)
         if max_task_tokens is not None
@@ -330,7 +334,8 @@ def run_agent(
     task_budget = TaskBudget(max_task_tokens=task_tok_cap, output_reserve=out_reserve)
     log(
         f"[agent] tool_visibility={tool_visibility} "
-        f"completion_mode={completion_mode} evidence_nudge_max={evidence_nudge_max}"
+        f"completion_mode={completion_mode} evidence_nudge_max={evidence_nudge_max} "
+        f"fake_green_mode={fake_green_mode}"
     )
     if task_budget.enabled:
         log(
@@ -598,16 +603,17 @@ def run_agent(
                     emit({"type": "step_end", "step": step, "kind": "steered"})
                     continue
                 final = (assistant_dict.get("content") or "").strip()
-                # Completion Evidence Gate: refuse "done" without tests when required
+                # Completion Evidence Gate: refuse "done" without Mustlist evidence
                 if ctx is not None:
                     block, why = should_block_completion(
                         ctx.task_state,
                         completion_mode=completion_mode,
                         max_nudges=evidence_nudge_max,
+                        fake_green_mode=fake_green_mode,
                     )
                     if block:
                         n = note_completion_nudge(ctx.task_state)
-                        nudge = build_evidence_nudge_message(ctx.task_state)
+                        nudge = build_evidence_nudge_message(ctx.task_state, reason=why)
                         messages.append({"role": "user", "content": nudge})
                         log(f"[completion_gate] blocked ({why}); nudge {n}/{evidence_nudge_max}")
                         emit(
@@ -619,6 +625,7 @@ def run_agent(
                                 "nudge": n,
                                 "max_nudges": evidence_nudge_max,
                                 "text": nudge,
+                                "mutated_paths": list(ctx.task_state.mutated_paths)[:12],
                             }
                         )
                         emit({"type": "step_end", "step": step, "kind": "completion_gate"})
@@ -633,6 +640,14 @@ def run_agent(
                                 "reason": why,
                             }
                         )
+                    elif why == "tests passed with fake_green_warn" or (
+                        is_fake_green(ctx.task_state)
+                        and fake_green_mode.strip().lower() == "warn"
+                    ):
+                        warn_ev = fake_green_warn_payload(ctx.task_state)
+                        warn_ev["step"] = step
+                        log(f"[completion_gate] {warn_ev.get('text')}")
+                        emit(warn_ev)
 
                 log(f"[agent] final:\n{final}")
                 emit({"type": "final", "step": step, "text": final, "stopped_reason": "completed"})
@@ -795,6 +810,24 @@ def run_agent(
                         raw_args=parsed if isinstance(parsed, dict) else raw_args,
                         result=result,
                     )
+                    if isinstance(stored, str) and stored.startswith("[soft-dedup]"):
+                        emit(
+                            {
+                                "type": "soft_dedup",
+                                "step": step,
+                                "id": call_id,
+                                "name": name,
+                                "path": (
+                                    str(parsed.get("path") or "")
+                                    if isinstance(parsed, dict)
+                                    else ""
+                                ),
+                                "text": stored[:400],
+                                "soft_dedup_events": int(
+                                    getattr(ctx.state, "soft_dedup_events", 0) or 0
+                                ),
+                            }
+                        )
                 elif ctx is not None and reused:
                     ctx.task_state.update_from_tool(
                         tool_name=name,

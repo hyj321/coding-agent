@@ -233,6 +233,7 @@ def run_coding_task(
         ask_fn=ask_fn,
         deny_high=high_deny,
         ask_min_risk=min_risk,  # type: ignore[arg-type]
+        network_policy=str(getattr(config, "network_policy", "high") or "high"),
     )
 
     registry = build_default_registry(

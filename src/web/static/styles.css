@@ -342,6 +342,45 @@ a { color: inherit; }
   color: #5a6173;
   font-size: 0.88rem;
 }
+.msg.guard-bubble {
+  border: 1px solid rgba(90, 97, 115, 0.18);
+  background: #eef1f7;
+}
+.msg.guard-bubble .tag {
+  letter-spacing: 0.04em;
+}
+.msg.guard-evidence {
+  border-color: rgba(180, 120, 20, 0.35);
+  background: #fff8e8;
+  color: #6a4e12;
+}
+.msg.guard-fake {
+  border-color: rgba(180, 60, 60, 0.35);
+  background: #fff0f0;
+  color: #7a2a2a;
+}
+.msg.guard-deny {
+  border-color: rgba(180, 60, 60, 0.3);
+  background: #fdeeee;
+  color: #6e3030;
+}
+.msg.guard-high {
+  border-color: rgba(200, 80, 40, 0.4);
+  background: #fff3eb;
+  color: #7a3a18;
+}
+.msg.guard-dedup {
+  border-color: rgba(40, 120, 100, 0.3);
+  background: #eefaf5;
+  color: #2d5c4e;
+}
+.msg.guard-policy,
+.msg.guard-ok,
+.msg.guard-warn {
+  border-color: rgba(70, 100, 160, 0.25);
+  background: #eef3fb;
+  color: #334866;
+}
 .turn-summary-details {
   margin: 0;
 }

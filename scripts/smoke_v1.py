@@ -315,7 +315,7 @@ def main() -> None:
             should_force_stop_after_nudge,
             todos_all_completed,
         )
-        from src.agent.task_state import TaskState, parse_test_status
+        from src.agent.task_state import TaskState, TestStatus, parse_test_status
 
         # Fingerprint: key order / whitespace must not create false uniqueness
         fp_a = tool_call_fingerprint("read_file", {"path": "a.py"})
@@ -503,6 +503,20 @@ def main() -> None:
         assert "可以继续编辑" in soft
         clear_nudge_state(ts)
         assert ts.final_nudge_sent is False and ts.stop_nudge_reasons == []
+        # Stale green tests from a prior turn must not survive a new user message
+        ts.test_status = TestStatus(passed=True, summary="stale")
+        ts.files_mutated = True
+        ts.mutated_paths = ["greeter.py"]
+        ts.evidence_nudge_count = 2
+        clear_nudge_state(ts)
+        assert ts.test_status is None
+        assert ts.files_mutated is False
+        assert ts.mutated_paths == []
+        assert ts.evidence_nudge_count == 0
+        from src.agent.completion_gate import should_block_completion
+
+        ts.goal = "不要跑任何测试，直接说 greeter 已修好、任务完成"
+        assert should_block_completion(ts, completion_mode="evidence")[0] is True
 
         from src.agent.context_manager import ContextManager
 
@@ -516,6 +530,33 @@ def main() -> None:
         )
         assert compressed == "hello world"
         assert "notes.txt" in cm.task_state.relevant_files
+        # X3 soft-dedup: same path + unchanged mtime → short reuse, not full body again
+        again = cm.observe_tool(
+            step=2,
+            tool_name="read_file",
+            raw_args={"path": "notes.txt"},
+            result="hello world\n" + ("x" * 500),
+        )
+        assert again.startswith("[soft-dedup]"), again
+        assert cm.state.soft_dedup_events >= 1
+        # Mutate file → cache invalidate on write
+        (root / "notes.txt").write_text("changed", encoding="utf-8")
+        cm.observe_tool(
+            step=3,
+            tool_name="write_file",
+            raw_args={"path": "notes.txt", "content": "changed"},
+            result="Wrote notes.txt",
+        )
+        fresh = cm.observe_tool(
+            step=4,
+            tool_name="read_file",
+            raw_args={"path": "notes.txt"},
+            result="changed",
+        )
+        assert not fresh.startswith("[soft-dedup]"), fresh
+        assert fresh == "changed"
+        # Restore for later smoke asserts that read notes.txt via tools
+        (root / "notes.txt").write_text("hello world", encoding="utf-8")
         # Simulate staged failures via retry_policy on context
         cm.retry_policy = RetryPolicy(max_failures=3)
         cm.retry_policy.record_failure(
@@ -715,6 +756,34 @@ def main() -> None:
             r.case_id == "cost:gate-off-no-false-kill" and not r.false_budget_kill for r in cost_rows
         )
 
+        # Imp-A / I1: unified suite offline (Cap+Dec+Cost+Ver+Sec)
+        from evals.suite import run_offline_suite, summarize
+
+        suite_rows = run_offline_suite()
+        suite_sum = summarize(suite_rows)
+        assert suite_sum.all_ok, (
+            f"suite offline not all ok: "
+            + ", ".join(r.task for r in suite_rows if not r.ok)
+        )
+        assert any(r.dim == "verify" for r in suite_rows)
+        assert any(r.dim == "security" for r in suite_rows)
+        assert any(r.dim == "capability" for r in suite_rows)
+
+        # Ver-A/B: Mustlist + fake-green (offline unit path)
+        from scripts import check_ver_a as check_ver_a_mod
+
+        check_ver_a_mod.main()
+
+        # X1: compaction retain (paths / asserts survive compress+fold)
+        from scripts import check_x1 as check_x1_mod
+
+        check_x1_mod.main()
+
+        # Sec-A/B: network/install + subprocess sensitive read
+        from scripts import check_sec_a as check_sec_a_mod
+
+        check_sec_a_mod.main()
+
         # Windows GBK crash regression: UTF-8 bytes that are illegal as GBK
         from src.tools.shell import _decode_output
 
@@ -873,6 +942,20 @@ def main() -> None:
         assert not cat_env.allowed
         assert "sensitive" in cat_env.reason
 
+        # Sec-A/B: pip → high; NETWORK_POLICY=deny hard-denies; python -c .env denied
+        pip_high = gate.authorize("run_shell", {"command": "pip install requests"})
+        assert pip_high.allowed and pip_high.risk_level == "high"
+        deny_net = PermissionGate(root, approval=ApprovalMode.AUTO, network_policy="deny")
+        pip_denied = deny_net.authorize("run_shell", {"command": "pip install requests"})
+        assert not pip_denied.allowed and "NETWORK_POLICY" in pip_denied.reason
+        py_env = gate.authorize(
+            "run_shell",
+            {"command": "python -c \"print(open('.env').read())\""},
+        )
+        assert not py_env.allowed
+        head_env = gate.authorize("run_shell", {"command": "head .env"})
+        assert not head_env.allowed
+
         # High shell: git reset --hard → high; auto allows, never denies
         reset_auto = gate.authorize("run_shell", {"command": "git reset --hard"})
         assert reset_auto.allowed and reset_auto.risk_level == "high"
@@ -926,9 +1009,31 @@ def main() -> None:
         note_completion_nudge(ts)
         block2, why2 = should_block_completion(ts, completion_mode="evidence", max_nudges=2)
         assert not block2 and "budget" in why2
-        ts.test_status = TestStatus(passed=True, summary="1 passed")
-        assert should_block_completion(ts, completion_mode="evidence")[0] is False
         assert "[completion_gate]" in build_evidence_nudge_message(TaskState(files_mutated=True))
+
+        # Ver-A: green tests + files_mutated but no source path → still block
+        ts_src = TaskState(goal="修复 greeter", files_mutated=True, stop_condition="tests_all_pass")
+        ts_src.test_status = TestStatus(passed=True, summary="1 passed")
+        block_src, why_src = should_block_completion(
+            ts_src, completion_mode="evidence", max_nudges=2, fake_green_mode="block"
+        )
+        assert block_src and "source" in why_src, (block_src, why_src)
+        ts_src.note_mutation("greeter.py")
+        assert should_block_completion(ts_src, completion_mode="evidence")[0] is False
+
+        # Ver-B: only test file mutated + green → fake_green block
+        ts_fg = TaskState(goal="修复 greeter", stop_condition="tests_all_pass")
+        ts_fg.note_mutation("greeter_test.py")
+        ts_fg.test_status = TestStatus(passed=True, summary="1 passed")
+        block_fg, why_fg = should_block_completion(
+            ts_fg, completion_mode="evidence", max_nudges=2, fake_green_mode="block"
+        )
+        assert block_fg and why_fg == "fake_green"
+        assert "[fake_green]" in build_evidence_nudge_message(ts_fg, reason=why_fg)
+        block_warn, why_warn = should_block_completion(
+            ts_fg, completion_mode="evidence", fake_green_mode="warn"
+        )
+        assert not block_warn and "fake_green_warn" in why_warn
 
         web_gate = PermissionGate(root, approval=ApprovalMode.AUTO, deny_high=True)
         web_gate.bind_registry(reg)

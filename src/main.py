@@ -105,6 +105,7 @@ def main(argv: list[str] | None = None) -> int:
         config.workdir,
         approval=config.approval,
         deny_high=bool(getattr(config, "deny_high", False)),
+        network_policy=str(getattr(config, "network_policy", "high") or "high"),
     )
     registry = build_default_registry(
         gate,
