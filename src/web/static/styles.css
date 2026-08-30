@@ -397,6 +397,33 @@ a { color: inherit; }
   align-items: center;
   gap: 14px;
 }
+.cost-panel {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  max-width: min(420px, 46vw);
+  justify-content: flex-end;
+}
+.cost-chip {
+  font-size: 0.72rem;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: #fff;
+  box-shadow: var(--shadow);
+  color: #4a5160;
+  white-space: nowrap;
+}
+.cost-panel[data-level="warn"] #costTokens {
+  color: #9a6700;
+  background: #fff8e8;
+}
+.cost-panel[data-level="critical"] #costTokens {
+  color: #a32020;
+  background: #fdecea;
+}
 .run-status {
   font-size: 0.78rem;
   font-weight: 700;
@@ -870,6 +897,29 @@ a { color: inherit; }
 .send:disabled {
   opacity: 0.45;
   cursor: not-allowed;
+}
+.stop {
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  border: 0;
+  background: #c0392b;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.stop:hover { background: #a93226; }
+.stop:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+.stop-icon {
+  width: 14px;
+  height: 14px;
+  border-radius: 2px;
+  background: #fff;
+  display: block;
 }
 
 /* Cursor-style context usage ring inside composer */

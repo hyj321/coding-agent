@@ -113,11 +113,11 @@ def should_force_stop_after_nudge(
 
 
 def force_stop_message(reasons: list[str]) -> str:
-    why = ", ".join(reasons) if reasons else "goal_met"
+    """User-facing FINAL when harness stops after tests already passed."""
+    _ = reasons  # internal codes stay out of the user text
     return (
-        f"（已停止：停机条件已满足（{why}），但模型仍在继续修改 — "
-        f"goal_met_forced。请核对最近一次测试通过时的状态。"
-        f"若需继续编辑，请再发一条消息。）"
+        "相关测试已经通过，本轮已自动结束，避免继续无意义改动。"
+        "若还要继续修改，直接再发一条消息即可。"
     )
 
 

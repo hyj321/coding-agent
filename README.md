@@ -10,15 +10,15 @@
 
 **Plan-then-Act（`todo_write`）**：非平凡任务用 3～5 条**阶段**清单（可与读文件同轮），最多一项 `in_progress`，阶段边界再更新；平凡单改可跳过。过程在终端与 transcript 中可见。
 
-**Skills（轻量）**：`skills/*/SKILL.md` 提供一类任务的可复用方法；system 只注入 name+description（L1），命中后用 `load_skill` 加载正文（L2）。已内置 `debugging`。
+**Skills（轻量）**：`skills/*/SKILL.md` 提供一类任务的可复用方法；system 只注入 name+description（L1），命中后用 `load_skill` 或**关键词预注入**加载正文（L2）。内置 `debugging` / `testing` / `refactoring`。
 
 **上下文容量条**：输入框下方显示剩余容量%；将满时提示先总结。每轮结束自动写入 `MEMORY.md` / `.agent/last_turn_summary.md` 并在界面展示摘要。
 
 ## 功能一览
 
 - Agent 主循环 + `max_steps` / 用户中断
-- 工具：`read_file` / `write_file` / `edit_file` / `list_dir` / `glob` / `run_shell` / `todo_write` / `load_skill` / `memory_search` / `rag_search`
-- Skills：渐进披露（目录常驻 + `load_skill` 按需加载），见 `skills/debugging/`
+- 工具：`read_file`（支持 `offset`/`limit` 切片）/ `write_file` / `edit_file` / `list_dir` / `glob` / `grep` / `run_shell` / `todo_write` / `load_skill` / `memory_search` / `rag_search`
+- Skills：渐进披露（目录常驻 + `load_skill` / 关键词预注入），见 `skills/{debugging,testing,refactoring}/`
 - 路径沙箱 + `--approval auto|ask|never`
 - **三级风险元数据**（`risk_level` / `is_readonly`）：Low 自动放行；Medium/High 受 approval 约束；`.env` / SSH Key 等敏感路径 **始终 Deny**
 - **Least Privilege 可见集**（`TOOL_VISIBILITY=auto`）：按 todo 阶段收窄本步工具；**Completion Evidence**：改文件后无测试绿不准宣称完成

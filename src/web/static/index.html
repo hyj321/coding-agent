@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=20260830k" />
+  <link rel="stylesheet" href="/static/styles.css?v=20260830steer3" />
   <script src="https://cdn.jsdelivr.net/npm/marked@15.0.7/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js"></script>
@@ -68,6 +68,10 @@
           </button>
         </div>
         <div class="topbar-right">
+          <div id="costPanel" class="cost-panel" title="本轮步数 + 上下文窗口粗估（非 API 账单）" aria-live="polite">
+            <span id="costSteps" class="cost-chip">— / — 步</span>
+            <span id="costTokens" class="cost-chip">≈ — tok</span>
+          </div>
           <div id="runStatus" class="run-status idle">空闲</div>
           <div class="user">
             <div class="avatar">CA</div>
@@ -145,6 +149,9 @@
                   <path d="M12 19V5M12 5l-6 6M12 5l6 6" stroke-linecap="round" stroke-linejoin="round"/>
                 </svg>
               </button>
+              <button id="stopBtn" class="stop hidden" type="button" aria-label="Stop" title="停止本轮">
+                <span class="stop-icon" aria-hidden="true"></span>
+              </button>
             </form>
             <p class="foot-note">拖入右侧文件可作为附件 · Local coding agent · demos in <code>/demos</code></p>
           </footer>
@@ -221,6 +228,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=20260830k"></script>
+  <script src="/static/app.js?v=20260830steer3"></script>
 </body>
 </html>

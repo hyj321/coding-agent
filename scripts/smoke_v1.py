@@ -31,6 +31,7 @@ def main() -> None:
         expected = {
             "edit_file",
             "glob",
+            "grep",
             "list_dir",
             "load_skill",
             "memory_search",
@@ -46,18 +47,105 @@ def main() -> None:
         assert skill_body.startswith("# Skill: debugging"), skill_body[:80]
         assert "todo_write" in skill_body and "edit_file" in skill_body
         assert reg.dispatch("load_skill", {"name": "missing"}).startswith("Error")
+        for extra in ("testing", "refactoring"):
+            body = reg.dispatch("load_skill", {"name": extra})
+            assert body.startswith(f"# Skill: {extra}"), body[:80]
 
         from src.agent.context_manager import build_system_prompt
-        from src.agent.skills import discover_skills, format_skills_catalog
+        from src.agent.skills import (
+            discover_skills,
+            format_skill_preload,
+            format_skills_catalog,
+            suggest_skills,
+        )
 
-        assert any(s.name == "debugging" for s in discover_skills())
+        names = {s.name for s in discover_skills()}
+        assert {"debugging", "testing", "refactoring"} <= names
         catalog = format_skills_catalog()
         assert "Available Skills" in catalog and "debugging" in catalog
+        assert "testing" in catalog and "refactoring" in catalog
         prompt = build_system_prompt(root, reg.names())
         assert "Available Skills" in prompt and "load_skill" in prompt
         assert "Batch tools" in prompt or "Batch tools in ONE" in prompt
         assert "phase-level" in prompt or "phase boundaries" in prompt
         assert "Trivial one-shot" in prompt
+        assert "Preloaded" in catalog or "preloaded" in catalog.lower()
+
+        # Keyword router: bug fix → debugging; 补测 → testing; 重构 → refactoring
+        dbg = suggest_skills("修复 greeter 测试失败的 bug")
+        assert dbg and dbg[0].name == "debugging", dbg
+        tst = suggest_skills("给 buggy_calc 补测并提高 coverage")
+        assert tst and tst[0].name == "testing", tst
+        ref = suggest_skills("重构 greet 函数，不改行为")
+        assert ref and ref[0].name == "refactoring", ref
+        assert suggest_skills("写一个 hello world") == []
+        preload = format_skill_preload("debugging", score=5, matched=("bug", "修复"))
+        assert "Preloaded Skill: debugging" in preload
+        assert "Do **not** call" in preload or "load_skill" in preload
+
+        from src.agent.cancel import build_interrupt_message, is_cancelled
+
+        assert is_cancelled(None) is False
+        ev = threading.Event()
+        assert is_cancelled(ev) is False
+        ev.set()
+        assert is_cancelled(ev) is True
+        msg = build_interrupt_message(changed_files=["greeter.py", "greeter.py", "a.py"])
+        assert "已按你的要求停止" in msg
+        assert "改成只修测试" in msg
+        assert msg.count("greeter.py") == 1
+        assert "`a.py`" in msg
+
+        # Cooperative cancel: Event set before step 1 → interrupted without LLM
+        class _FakeCfg:
+            model = "fake"
+            context_token_budget = 8000
+            tool_visibility = "all"
+            completion_mode = "off"
+            evidence_nudge_max = 0
+            loop_warn_after = 3
+            loop_stop_after = 5
+            loop_error_nudge_after = 2
+            retry_max_failures = 3
+            final_nudge_mutating_limit = 2
+            workdir = root
+
+        class _FakeClient:
+            config = _FakeCfg()
+            cache_policy = None
+
+            def chat(self, *_a, **_k):
+                raise AssertionError("LLM should not be called when cancel is already set")
+
+        from src.agent.loop import run_agent as _run_agent
+
+        cancel = threading.Event()
+        cancel.set()
+        events = []
+        result = _run_agent(
+            client=_FakeClient(),
+            registry=reg,
+            system_prompt="sys",
+            user_task="do something long",
+            max_steps=5,
+            gate=gate,
+            on_event=events.append,
+            cancel_event=cancel,
+            persist_memory_md=False,
+        )
+        assert result.stopped_reason == "interrupted"
+        assert "已按你的要求停止" in result.final_text
+        assert any(e.get("type") == "final" and e.get("stopped_reason") == "interrupted" for e in events)
+
+        # Mid-run steer inbox drains into messages
+        from src.agent.steer import SteerInbox, format_steer_message, STEER_MARKER
+
+        inbox = SteerInbox()
+        assert inbox.push("  only fix tests  ")
+        assert inbox.pending_count() == 1
+        assert inbox.drain() == ["only fix tests"]
+        assert inbox.drain() == []
+        assert STEER_MARKER in format_steer_message("改成只修测试")
 
         from src.agent.loop import LoopGuard, tool_call_fingerprint
         from src.agent.loop_guard import LoopGuard as LoopGuardDirect
@@ -240,11 +328,31 @@ def main() -> None:
         gl = reg.dispatch("glob", {"pattern": "**/*.py"})
         assert "sub/a.py" in gl.replace("\\", "/")
 
+        # read_file offset/limit (1-based lines)
+        (root / "long.py").write_text(
+            "\n".join(f"line{i}" for i in range(1, 11)) + "\n",
+            encoding="utf-8",
+        )
+        sliced = reg.dispatch("read_file", {"path": "long.py", "offset": 3, "limit": 2})
+        assert "lines 3-4 of 10" in sliced
+        assert "line3" in sliced and "line4" in sliced
+        assert "line2" not in sliced and "line5" not in sliced
+        past = reg.dispatch("read_file", {"path": "long.py", "offset": 99})
+        assert past.startswith("Error")
+
+        grepped = reg.dispatch("grep", {"pattern": r"line[79]", "path": "long.py"})
+        assert "long.py:7:" in grepped and "long.py:9:" in grepped
+
         written = reg.dispatch(
             "write_file",
             {"path": "sub/out.py", "content": "print(42)\n"},
         )
         assert "out.py" in written
+
+        grepped_dir = reg.dispatch("grep", {"pattern": r"print\(42\)", "path": "."})
+        assert "sub/out.py" in grepped_dir.replace("\\", "/")
+        bad_re = reg.dispatch("grep", {"pattern": "("})
+        assert bad_re.startswith("Error")
 
         shell = reg.dispatch("run_shell", {"command": "python -c \"print('ok')\""})
         assert "exit_code: 0" in shell
@@ -329,6 +437,44 @@ def main() -> None:
         assert any(e.get("type") == "approval_resolved" and e.get("allowed") for e in events)
         bridge.close()
 
+        # Stop during pending approval → ask returns False quickly
+        cancel_ev = threading.Event()
+        cancel_events: list[dict] = []
+        cancel_bridge = ApprovalBridge(
+            cancel_events.append, timeout_sec=30.0, cancel_event=cancel_ev
+        )
+        cancel_box: list[bool] = []
+
+        def _ask_then_cancel() -> None:
+            cancel_box.append(
+                cancel_bridge.ask(
+                    ApprovalPrompt(
+                        tool_name="run_shell",
+                        risk_level="high",
+                        summary="rm -rf",
+                        arguments={"command": "echo x"},
+                        call_id="call_stop",
+                    )
+                )
+            )
+
+        t_ask = threading.Thread(target=_ask_then_cancel, daemon=True)
+        t_ask.start()
+        for _ in range(50):
+            if cancel_bridge.pending_id():
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("cancel approval never pending")
+        cancel_ev.set()
+        cancel_bridge.close()
+        t_ask.join(timeout=2)
+        assert cancel_box == [False]
+        assert any(
+            e.get("type") == "approval_resolved" and e.get("reason") == "cancelled"
+            for e in cancel_events
+        )
+
         # ask_min_risk=high: medium write auto-allowed without callback
         high_only = PermissionGate(
             root,
@@ -403,6 +549,7 @@ def main() -> None:
 
         explore_names = visible_tool_names(reg, "explore")
         assert "read_file" in explore_names and "write_file" not in explore_names
+        assert "grep" in explore_names and "glob" in explore_names
         assert "run_shell" not in explore_names
         verify_names = visible_tool_names(reg, "verify")
         assert "run_shell" in verify_names and "edit_file" in verify_names
@@ -554,7 +701,7 @@ def main() -> None:
         assert sess_u["turns"][-1]["context_usage"]["remaining_pct"] == 55
 
         schemas = reg.openai_tools()
-        assert len(schemas) == 10
+        assert len(schemas) == 11
         assert any(s["function"]["name"] == "load_skill" for s in schemas)
 
         todo_out = reg.dispatch(

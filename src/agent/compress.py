@@ -112,7 +112,7 @@ def compress_tool_result(
         compressed = _compress_shell(result)
     elif name == "todo_write":
         return result  # already compact checklist
-    elif name in {"read_file", "list_dir", "glob", "memory_search", "rag_search"}:
+    elif name in {"read_file", "list_dir", "glob", "grep", "memory_search", "rag_search"}:
         compressed = _compress_readish(result, soft_limit)
     elif name in {"write_file", "edit_file"}:
         return _clip(result, soft_limit)

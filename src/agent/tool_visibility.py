@@ -29,6 +29,7 @@ _READONLY = frozenset(
     {
         "list_dir",
         "glob",
+        "grep",
         "read_file",
         "todo_write",
         "load_skill",

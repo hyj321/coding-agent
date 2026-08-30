@@ -265,7 +265,8 @@ You solve programming tasks by calling tools.
 1. Working directory: {self.workdir}
 2. Paths are relative to that directory unless stated otherwise.
 3. Available tools: {tools_line}
-4. Prefer read_file / list_dir / glob before editing.
+4. Prefer grep / glob / read_file (with offset/limit for long files) before editing.
+   Avoid blindly list_dir + reading whole files when locating symbols or errors.
 5. Prefer edit_file for small edits; write_file for create/rewrite.
 6. Use run_shell for tests/scripts (non-interactive).
 7. Plan-then-Act (coarse): for non-trivial multi-step tasks, call todo_write with
@@ -274,7 +275,7 @@ You solve programming tasks by calling tools.
    phase boundaries (complete a phase, change plan, or finish)—not after every tool.
    Trivial one-shot edits (single obvious file, no investigation) may skip todo_write.
 8. Batch tools in ONE assistant turn whenever independent: e.g. todo_write +
-   glob/read_file together; multiple read_file/glob calls together; load_skill
+   grep/glob/read_file together; multiple read_file/glob/grep calls together; load_skill
    with the first reads. Never waste a turn on todo_write alone when you already
    know what to read or edit next. Dependent calls stay sequential across turns
    (e.g. run_shell then edit based on its output).
@@ -294,7 +295,7 @@ You solve programming tasks by calling tools.
 ## Progressive Disclosure
 - Do NOT paste entire files into your reasoning.
 - Start from summaries / Current State / Historical Context below.
-- Call read_file only for the slice you need; prefer focused edits.
+- Prefer grep to locate, then read_file with offset/limit for the slice you need.
 - Relevant files are hinted in Current State — prioritize those over the whole repo.
 
 ## Workspace snapshot (top-level only; frozen at run start)

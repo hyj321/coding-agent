@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from src.web.approval import ApprovalBridge
+from src.agent.steer import SteerInbox
 from src.web.runner import (
     build_tree,
     delete_workdir_file,
@@ -33,13 +34,15 @@ from src.web.runner import (
 )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-ASSET_VERSION = "20260830k"
+ASSET_VERSION = "20260830steer3"
 
 app = FastAPI(title="CodeAgent", version="0.5.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 _run_lock = threading.Lock()
 _active_bridge: ApprovalBridge | None = None
+_active_cancel: threading.Event | None = None
+_active_steer: Any | None = None
 _bridge_lock = threading.Lock()
 
 
@@ -61,6 +64,10 @@ class RunRequest(BaseModel):
 class ApproveRequest(BaseModel):
     request_id: str = Field(..., min_length=4, max_length=64)
     allowed: bool
+
+
+class SteerRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=4000)
 
 
 class WriteFileRequest(BaseModel):
@@ -100,6 +107,8 @@ def meta() -> dict[str, Any]:
             "fs_delete": True,
             "attach_drop": True,
             "approval": True,
+            "stop": True,
+            "steer": True,
         },
         "suggestions": [
             {
@@ -298,6 +307,38 @@ def approve_tool(body: ApproveRequest) -> dict[str, Any]:
     return result
 
 
+@app.post("/api/stop")
+def stop_run() -> dict[str, Any]:
+    """Cooperatively cancel the in-flight agent run (Stop button)."""
+    with _bridge_lock:
+        cancel = _active_cancel
+        bridge = _active_bridge
+    if cancel is None:
+        raise HTTPException(status_code=409, detail="no active run to stop")
+    cancel.set()
+    if bridge is not None:
+        bridge.close()
+    return {"ok": True, "stopped": True}
+
+
+@app.post("/api/steer")
+def steer_run(body: SteerRequest) -> dict[str, Any]:
+    """Queue a mid-run user correction (injected at the next step boundary)."""
+    text = body.message.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="message is required")
+    with _bridge_lock:
+        inbox = _active_steer
+    if inbox is None:
+        raise HTTPException(
+            status_code=409,
+            detail="没有进行中的任务可纠偏（可能已结束或页面已刷新）。请重新发送任务。",
+        )
+    if not inbox.push(text):
+        raise HTTPException(status_code=400, detail="empty message")
+    return {"ok": True, "queued": True, "pending": inbox.pending_count()}
+
+
 @app.post("/api/run")
 async def run_stream(body: RunRequest) -> StreamingResponse:
     task = body.task.strip()
@@ -305,7 +346,10 @@ async def run_stream(body: RunRequest) -> StreamingResponse:
         raise HTTPException(status_code=400, detail="task is required")
 
     if not _run_lock.acquire(blocking=False):
-        raise HTTPException(status_code=409, detail="Another agent run is already in progress")
+        raise HTTPException(
+            status_code=409,
+            detail="上一轮任务仍在执行。请先点红色「停止」，或等本轮结束后再发。",
+        )
 
     workdir = body.workdir or "demos"
     try:
@@ -326,10 +370,14 @@ async def run_stream(body: RunRequest) -> StreamingResponse:
         loop.call_soon_threadsafe(queue.put_nowait, event)
 
     def worker() -> None:
-        global _active_bridge
-        bridge = ApprovalBridge(emit)
+        global _active_bridge, _active_cancel, _active_steer
+        cancel_event = threading.Event()
+        steer_inbox = SteerInbox()
+        bridge = ApprovalBridge(emit, cancel_event=cancel_event)
         with _bridge_lock:
             _active_bridge = bridge
+            _active_cancel = cancel_event
+            _active_steer = steer_inbox
         try:
             emit(
                 {
@@ -361,6 +409,8 @@ async def run_stream(body: RunRequest) -> StreamingResponse:
                 ask_fn=bridge.ask,
                 ask_min_risk=ask_min_risk,
                 deny_high=False,
+                cancel_event=cancel_event,
+                steer_inbox=steer_inbox,
             )
             emit(
                 {
@@ -382,6 +432,10 @@ async def run_stream(body: RunRequest) -> StreamingResponse:
             with _bridge_lock:
                 if _active_bridge is bridge:
                     _active_bridge = None
+                if _active_cancel is cancel_event:
+                    _active_cancel = None
+                if _active_steer is steer_inbox:
+                    _active_steer = None
             try:
                 _run_lock.release()
             except RuntimeError:

@@ -1,7 +1,8 @@
-"""Filesystem tools: read_file, write_file, list_dir."""
+"""Filesystem tools: read_file, write_file, list_dir, edit_file, glob, grep."""
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -9,11 +10,36 @@ from src.agent.permissions import PermissionGate
 from src.tools.fs_noise import is_noise_entry
 from src.tools.base import FunctionTool, ToolRegistry
 
+# Soft hint when a full-file read is large (encourages offset/limit next time)
+_LARGE_FILE_LINES = 200
+_DEFAULT_GREP_MAX_MATCHES = 50
+_DEFAULT_GREP_MAX_FILES = 80
+_BINARY_SAMPLE = 8192
+
 
 def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n...[truncated, total {len(text)} chars]"
+
+
+def _parse_int(raw: Any, *, name: str) -> int | None:
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"Error: {name} must be an integer") from None
+
+
+def _is_probably_text(path: Path) -> bool:
+    try:
+        chunk = path.read_bytes()[:_BINARY_SAMPLE]
+    except OSError:
+        return False
+    if b"\x00" in chunk:
+        return False
+    return True
 
 
 def register_filesystem_tools(
@@ -29,10 +55,49 @@ def register_filesystem_tools(
         if not path.is_file():
             return f"Error: not a file: {path}"
         try:
+            offset = _parse_int(args.get("offset"), name="offset")
+            limit = _parse_int(args.get("limit"), name="limit")
+        except ValueError as exc:
+            return str(exc)
+        if offset is not None and offset < 1:
+            return "Error: offset is 1-based; must be >= 1"
+        if limit is not None and limit < 1:
+            return "Error: limit must be >= 1"
+        try:
             content = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             return f"Error: cannot decode as UTF-8: {path}"
-        return _truncate(content, max_output_chars)
+
+        lines = content.splitlines(keepends=True)
+        total = len(lines)
+
+        if offset is None and limit is None:
+            if total >= _LARGE_FILE_LINES:
+                rel = path.relative_to(gate.workdir).as_posix()
+                header = (
+                    f"# {rel} — {total} lines (full)\n"
+                    f"# Hint: file is long; prefer read_file with offset/limit "
+                    f"(e.g. offset=1, limit=80) or use grep.\n"
+                )
+                return _truncate(header + content, max_output_chars)
+            return _truncate(content, max_output_chars)
+
+        start = (offset or 1) - 1  # 0-based
+        if start >= total and total > 0:
+            return (
+                f"Error: offset {offset or 1} past end of file "
+                f"({total} lines). Use offset 1..{total}."
+            )
+        if limit is None:
+            chunk = lines[start:]
+            end_line = total
+        else:
+            chunk = lines[start : start + limit]
+            end_line = start + len(chunk)
+        body = "".join(chunk)
+        rel = path.relative_to(gate.workdir).as_posix()
+        header = f"# {rel} — lines {start + 1}-{end_line} of {total}\n"
+        return _truncate(header + body, max_output_chars)
 
     def write_file(args: dict[str, Any]) -> str:
         path = gate.resolve_path(args["path"])
@@ -107,7 +172,6 @@ def register_filesystem_tools(
         pattern = args.get("pattern")
         if not pattern or not isinstance(pattern, str):
             return "Error: missing required string argument 'pattern'"
-        # Prevent escaping via absolute patterns; resolve matches under workdir only.
         root = gate.workdir
         matches: list[str] = []
         for match in sorted(root.glob(pattern)):
@@ -125,12 +189,94 @@ def register_filesystem_tools(
             return f"(no files matched pattern {pattern!r})"
         return _truncate("\n".join(matches), max_output_chars)
 
+    def grep_files(args: dict[str, Any]) -> str:
+        pattern = args.get("pattern")
+        if not pattern or not isinstance(pattern, str):
+            return "Error: missing required string argument 'pattern'"
+        try:
+            flags = re.IGNORECASE if bool(args.get("case_insensitive", False)) else 0
+            regex = re.compile(pattern, flags)
+        except re.error as exc:
+            return f"Error: invalid regex: {exc}"
+
+        path_arg = args.get("path") or "."
+        try:
+            search_root = gate.resolve_path(str(path_arg))
+        except Exception as exc:  # noqa: BLE001
+            return f"Error: {exc}"
+
+        if not search_root.exists():
+            return f"Error: path not found: {path_arg}"
+
+        try:
+            max_matches = _parse_int(args.get("max_matches"), name="max_matches")
+        except ValueError as exc:
+            return str(exc)
+        if max_matches is None:
+            max_matches = _DEFAULT_GREP_MAX_MATCHES
+        if max_matches < 1:
+            return "Error: max_matches must be >= 1"
+        max_matches = min(max_matches, 200)
+
+        files: list[Path] = []
+        if search_root.is_file():
+            files = [search_root]
+        elif search_root.is_dir():
+            for p in sorted(search_root.rglob("*")):
+                if not p.is_file():
+                    continue
+                try:
+                    rel = p.resolve().relative_to(gate.workdir.resolve())
+                except (ValueError, OSError):
+                    continue
+                if any(is_noise_entry(part) for part in rel.parts):
+                    continue
+                files.append(p)
+                if len(files) >= _DEFAULT_GREP_MAX_FILES * 4:
+                    break
+        else:
+            return f"Error: not a file or directory: {path_arg}"
+
+        hits: list[str] = []
+        files_scanned = 0
+        truncated = False
+        for fpath in files:
+            if search_root.is_dir() and files_scanned >= _DEFAULT_GREP_MAX_FILES:
+                truncated = True
+                break
+            if not _is_probably_text(fpath):
+                continue
+            files_scanned += 1
+            try:
+                text = fpath.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            rel = fpath.resolve().relative_to(gate.workdir.resolve()).as_posix()
+            for i, line in enumerate(text.splitlines(), start=1):
+                if regex.search(line):
+                    preview = line if len(line) <= 200 else line[:200] + "…"
+                    hits.append(f"{rel}:{i}:{preview}")
+                    if len(hits) >= max_matches:
+                        truncated = True
+                        break
+            if truncated and len(hits) >= max_matches:
+                break
+
+        if not hits:
+            return f"(no matches for {pattern!r} under {path_arg})"
+        footer = ""
+        if truncated:
+            footer = f"\n...[truncated at {len(hits)} matches / {files_scanned} files scanned]"
+        header = f"# grep {pattern!r} in {path_arg} — {len(hits)} hit(s)\n"
+        return _truncate(header + "\n".join(hits) + footer, max_output_chars)
+
     registry.register(
         FunctionTool(
             name="read_file",
             description=(
                 "Read a UTF-8 text file under the working directory. "
-                "Path is relative to workdir unless absolute and still inside workdir."
+                "Optional offset/limit (1-based line numbers) to read a slice — "
+                "prefer slicing for long files instead of loading everything."
             ),
             parameters={
                 "type": "object",
@@ -138,7 +284,15 @@ def register_filesystem_tools(
                     "path": {
                         "type": "string",
                         "description": "File path relative to the working directory.",
-                    }
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "1-based start line (inclusive). Omit to start at line 1.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max number of lines to return. Omit for the rest of the file.",
+                    },
                 },
                 "required": ["path"],
             },
@@ -245,6 +399,41 @@ def register_filesystem_tools(
                 "required": ["pattern"],
             },
             handler=glob_files,
+            risk_level="low",
+            is_readonly=True,
+        )
+    )
+    registry.register(
+        FunctionTool(
+            name="grep",
+            description=(
+                "Search file contents with a regex under the working directory "
+                "(path:line:text). Prefer grep over blind list_dir/read_file when "
+                "locating symbols, errors, or failing assertions."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Python/regex pattern to search for.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "File or directory relative to workdir (default '.').",
+                    },
+                    "case_insensitive": {
+                        "type": "boolean",
+                        "description": "If true, ignore case (default false).",
+                    },
+                    "max_matches": {
+                        "type": "integer",
+                        "description": "Cap on returned hits (default 50, max 200).",
+                    },
+                },
+                "required": ["pattern"],
+            },
+            handler=grep_files,
             risk_level="low",
             is_readonly=True,
         )

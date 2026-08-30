@@ -13,6 +13,7 @@ from src.agent.completion_gate import (
     note_completion_nudge,
     should_block_completion,
 )
+from src.agent.cancel import build_interrupt_message, is_cancelled
 from src.agent.context import ContextManager, sanitize_tool_pairing, trim_messages
 from src.agent.loop_guard import LoopGuard, tool_call_fingerprint
 from src.agent.memory import (
@@ -24,6 +25,8 @@ from src.agent.memory import (
 )
 from src.agent.permissions import PermissionGate
 from src.agent.retry_policy import RetryPolicy
+from src.agent.skills import format_skill_preload, suggest_skills
+from src.agent.steer import SteerInbox, format_steer_message
 from src.agent.stop_conditions import (
     build_final_nudge_message,
     clear_nudge_state,
@@ -170,6 +173,8 @@ def run_agent(
     context_manager: ContextManager | None = None,
     persist_memory_md: bool = True,
     transcript_dir: Path | None = None,
+    cancel_event: Any | None = None,
+    steer_inbox: SteerInbox | None = None,
 ) -> AgentResult:
     """Core harness loop with ACON-inspired Context Manager.
 
@@ -177,12 +182,60 @@ def run_agent(
       (prefer memory + recent K + original task; not the full dump).
     prior_memory: ContextManager.export_memory() from the previous turn.
     ContextManager: observation compression + layered fold when over token budget.
+    cancel_event: optional threading.Event; when set, stop cooperatively
+      (stopped_reason=interrupted) after the current LLM/tool boundary.
+    steer_inbox: optional mid-run user corrections drained between steps.
     """
     log = log or _default_log
 
     def emit(event: dict[str, Any]) -> None:
         if on_event is not None:
             on_event(event)
+
+    mutated_paths: list[str] = []
+
+    def _interrupt_result(*, step: int, messages: list[dict[str, Any]]) -> AgentResult:
+        final = build_interrupt_message(changed_files=mutated_paths)
+        log("\n[agent] interrupted by user")
+        emit(
+            {
+                "type": "final",
+                "step": step,
+                "text": final,
+                "stopped_reason": "interrupted",
+                "changed_files": list(dict.fromkeys(mutated_paths)),
+            }
+        )
+        return _finish(
+            AgentResult(
+                final_text=final,
+                steps=step,
+                stopped_reason="interrupted",
+                messages=messages,
+                memory=ctx.export_memory() if ctx is not None else None,
+            )
+        )
+
+    def _drain_steers(messages: list[dict[str, Any]], *, step: int) -> bool:
+        """Inject pending mid-run user steers. Returns True if any injected."""
+        if steer_inbox is None:
+            return False
+        items = steer_inbox.drain()
+        if not items:
+            return False
+        for text in items:
+            block = format_steer_message(text)
+            messages.append({"role": "user", "content": block})
+            log(f"[agent] steer@{step}: {text[:160]!r}")
+            emit({"type": "steer", "step": step, "text": text})
+        if ctx is not None:
+            clear_nudge_state(ctx.task_state)
+            ctx.post_nudge_mutating = 0
+            # Latest steer becomes the active goal signal
+            latest = items[-1].strip()[:500]
+            ctx.state.task = latest
+            ctx.task_state.goal = latest
+        return True
 
     workdir = gate.workdir if gate is not None else getattr(client.config, "workdir", None)
     ctx = context_manager
@@ -219,6 +272,32 @@ def run_agent(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_task},
         ]
+
+    # Keyword skill router: high-confidence match → preload body (saves load_skill step)
+    preloaded_skill: str | None = None
+    preloaded_meta: dict[str, Any] | None = None
+    suggestions = suggest_skills(user_task)
+    if suggestions:
+        pick = suggestions[0]
+        block = format_skill_preload(pick.name, score=pick.score, matched=pick.matched)
+        if block:
+            last = messages[-1]
+            if last.get("role") == "user":
+                last["content"] = f"{last.get('content') or ''}\n\n{block}"
+            else:
+                messages.append({"role": "user", "content": block})
+            preloaded_skill = pick.name
+            preloaded_meta = {
+                "name": pick.name,
+                "score": pick.score,
+                "matched": list(pick.matched),
+                "via": "keyword_router",
+            }
+            log(
+                f"[agent] skill_preload={pick.name} score={pick.score} "
+                f"hits={list(pick.matched)[:4]}"
+            )
+
     messages = sanitize_tool_pairing(messages)
     if ctx is not None:
         ctx.ensure_task_goal(user_task)
@@ -264,8 +343,11 @@ def run_agent(
             "context_token_budget": ctx.token_budget if ctx is not None else None,
             "has_project_memory": bool(ctx and ctx.state.project_memory),
             "prompt_layout": ctx.state.layout_mode if ctx is not None else None,
+            "preloaded_skill": preloaded_skill,
         }
     )
+    if preloaded_meta is not None:
+        emit({"type": "skill_loaded", **preloaded_meta})
 
     loop_guard = LoopGuard.from_env(
         warn_after=getattr(cfg, "loop_warn_after", None),
@@ -343,6 +425,11 @@ def run_agent(
 
     try:
         for step in range(1, max_steps + 1):
+            if is_cancelled(cancel_event):
+                return _interrupt_result(step=max(0, step - 1), messages=messages)
+
+            _drain_steers(messages, step=step)
+
             log(f"\n=== step {step}/{max_steps} ===")
             emit({"type": "step_start", "step": step, "max_steps": max_steps})
 
@@ -384,6 +471,8 @@ def run_agent(
             else:
                 model_messages = trim_messages(messages, max_messages=max_messages)
             response = client.chat(model_messages, tools=tools)
+            if is_cancelled(cancel_event):
+                return _interrupt_result(step=step, messages=messages)
             choice = response.choices[0]
             message = choice.message
             assistant_dict = _message_to_dict(message)
@@ -391,6 +480,10 @@ def run_agent(
 
             tool_calls = assistant_dict.get("tool_calls") or []
             if not tool_calls:
+                # Mid-run steer arrived while model tried to finish → keep going
+                if _drain_steers(messages, step=step):
+                    emit({"type": "step_end", "step": step, "kind": "steered"})
+                    continue
                 final = (assistant_dict.get("content") or "").strip()
                 # Completion Evidence Gate: refuse "done" without tests when required
                 if ctx is not None:
@@ -450,6 +543,9 @@ def run_agent(
             step_had_failure = False
 
             for tc in tool_calls:
+                if is_cancelled(cancel_event):
+                    return _interrupt_result(step=step, messages=messages)
+
                 name = tc["function"]["name"]
                 raw_args = tc["function"]["arguments"]
                 call_id = tc["id"]
@@ -562,6 +658,23 @@ def run_agent(
 
                 if not reused:
                     loop_guard.same_step_store(fp, stored)
+
+                # Timeline: model-initiated load_skill (when not already preloaded)
+                if (
+                    name == "load_skill"
+                    and isinstance(parsed, dict)
+                    and not str(result).startswith("Error")
+                ):
+                    loaded_name = str(parsed.get("name") or "").strip()
+                    if loaded_name and loaded_name != preloaded_skill:
+                        emit(
+                            {
+                                "type": "skill_loaded",
+                                "name": loaded_name,
+                                "via": "load_skill",
+                                "step": step,
+                            }
+                        )
 
                 # Outcome for error-streak: use underlying tool body, not dedup wrapper
                 body_for_ok = cached if reused else result
@@ -796,6 +909,7 @@ def run_agent(
                             "is_new": before_text is None,
                         }
                     )
+                    mutated_paths.append(rel_path.replace("\\", "/"))
 
                 if ctx is not None:
                     emit(
@@ -841,6 +955,9 @@ def run_agent(
                         )
                     )
 
+            # All tool results appended — safe to inject mid-run steers for next LLM turn
+            _drain_steers(messages, step=step)
+
             # Soft stop: tests passed / todos done → urge FINAL (once)
             if ctx is not None and not ctx.task_state.final_nudge_sent:
                 urge, reasons = evaluate_final_nudge(
@@ -878,17 +995,7 @@ def run_agent(
             )
         )
     except KeyboardInterrupt:
-        log("\n[agent] interrupted by user")
-        emit({"type": "error", "message": "interrupted by user", "stopped_reason": "interrupted"})
-        return _finish(
-            AgentResult(
-                final_text="(interrupted)",
-                steps=0,
-                stopped_reason="interrupted",
-                messages=messages,
-                memory=ctx.export_memory() if ctx is not None else None,
-            )
-        )
+        return _interrupt_result(step=0, messages=messages)
     except Exception as exc:
         emit({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
         raise

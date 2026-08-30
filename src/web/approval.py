@@ -1,7 +1,7 @@
 """Interactive approval bridge for Web SSE + POST /api/approve.
 
 Worker thread calls ask() which emits approval_request over SSE and blocks
-until the browser POSTs a decision (or timeout / cancel).
+until the browser POSTs a decision (or timeout / cancel / Stop).
 """
 
 from __future__ import annotations
@@ -25,9 +25,11 @@ class ApprovalBridge:
         emit: EmitFn,
         *,
         timeout_sec: float = DEFAULT_TIMEOUT_SEC,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         self._emit = emit
         self._timeout_sec = timeout_sec
+        self._cancel_event = cancel_event
         self._lock = threading.Lock()
         self._event: threading.Event | None = None
         self._request_id: str | None = None
@@ -36,6 +38,8 @@ class ApprovalBridge:
 
     def ask(self, prompt: ApprovalPrompt | str) -> bool:
         if self._closed:
+            return False
+        if self._cancel_event is not None and self._cancel_event.is_set():
             return False
 
         if isinstance(prompt, ApprovalPrompt):
@@ -77,13 +81,42 @@ class ApprovalBridge:
             }
         )
 
-        ok = event.wait(timeout=self._timeout_sec)
+        # Poll so Stop can unblock without waiting full timeout
+        remaining = float(self._timeout_sec)
+        slice_sec = 0.25
+        ok = False
+        while remaining > 0:
+            if self._closed or (
+                self._cancel_event is not None and self._cancel_event.is_set()
+            ):
+                break
+            wait = slice_sec if remaining > slice_sec else remaining
+            if event.wait(timeout=wait):
+                ok = True
+                break
+            remaining -= wait
+
         with self._lock:
-            timed_out = not ok
+            cancelled = self._closed or (
+                self._cancel_event is not None and self._cancel_event.is_set()
+            )
+            timed_out = not ok and not cancelled
             allowed = bool(self._result) if ok else False
             if self._request_id == request_id:
                 self._request_id = None
                 self._event = None
+            if cancelled:
+                self._emit(
+                    {
+                        "type": "approval_resolved",
+                        "request_id": request_id,
+                        "allowed": False,
+                        "reason": "cancelled",
+                        "tool_name": tool_name,
+                        "call_id": call_id,
+                    }
+                )
+                return False
             if timed_out:
                 self._emit(
                     {

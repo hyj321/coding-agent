@@ -4,6 +4,7 @@ const timeline = document.getElementById("timeline");
 const composer = document.getElementById("composer");
 const chatInput = document.getElementById("chatInput");
 const sendBtn = document.getElementById("sendBtn");
+const stopBtn = document.getElementById("stopBtn");
 const workdirInput = document.getElementById("workdirInput");
 const maxStepsInput = document.getElementById("maxStepsInput");
 const suggestionCards = document.getElementById("suggestionCards");
@@ -12,6 +13,9 @@ const historySearch = document.getElementById("historySearch");
 const todoList = document.getElementById("todoList");
 const todoEmpty = document.getElementById("todoEmpty");
 const runStatus = document.getElementById("runStatus");
+const costPanel = document.getElementById("costPanel");
+const costSteps = document.getElementById("costSteps");
+const costTokens = document.getElementById("costTokens");
 const contextRing = document.getElementById("contextRing");
 const contextRingArc = document.getElementById("contextRingArc");
 const contextRingDetail = document.getElementById("contextRingDetail");
@@ -77,6 +81,101 @@ function newSessionId() {
 const CONTEXT_RING_LEN = 87.96;
 let contextRingOpen = false;
 let lastContextUsage = null;
+
+/** Per-turn cost panel (steps + rough context tokens). */
+let turnCost = {
+  step: 0,
+  maxSteps: 0,
+  usedTokens: null,
+  budgetTokens: null,
+  peakTokens: 0,
+  level: "ok",
+};
+
+function formatTok(n) {
+  if (n == null || !Number.isFinite(Number(n))) return "—";
+  const v = Number(n);
+  if (v >= 1000) return `${(v / 1000).toFixed(v >= 10000 ? 0 : 1)}k`;
+  return String(Math.round(v));
+}
+
+function renderCostPanel() {
+  if (costSteps) {
+    const cur = turnCost.step > 0 ? turnCost.step : "—";
+    const max = turnCost.maxSteps > 0 ? turnCost.maxSteps : "—";
+    costSteps.textContent = `${cur} / ${max} 步`;
+  }
+  if (costTokens) {
+    const used = formatTok(turnCost.usedTokens);
+    const budget = formatTok(turnCost.budgetTokens);
+    if (turnCost.usedTokens == null && turnCost.budgetTokens == null) {
+      costTokens.textContent = "≈ — tok";
+    } else if (turnCost.budgetTokens != null) {
+      costTokens.textContent = `≈ ${used} / ${budget} tok`;
+    } else {
+      costTokens.textContent = `≈ ${used} tok`;
+    }
+  }
+  if (costPanel) {
+    costPanel.dataset.level = turnCost.level || "ok";
+    const peak =
+      turnCost.peakTokens > 0 ? ` · 峰值 ${formatTok(turnCost.peakTokens)}` : "";
+    costPanel.title =
+      `本轮步数 + 上下文窗口粗估（非 API 账单）${peak}`;
+  }
+}
+
+function resetCostPanel(maxSteps) {
+  turnCost = {
+    step: 0,
+    maxSteps: maxSteps != null ? Number(maxSteps) || 0 : 0,
+    usedTokens: null,
+    budgetTokens: null,
+    peakTokens: 0,
+    level: "ok",
+  };
+  renderCostPanel();
+}
+
+function noteCostStep(step, maxSteps) {
+  if (step != null) turnCost.step = Number(step) || 0;
+  if (maxSteps != null) turnCost.maxSteps = Number(maxSteps) || turnCost.maxSteps;
+  renderCostPanel();
+}
+
+function noteCostUsage(data) {
+  if (!data) return;
+  if (data.used_tokens != null) {
+    const used = Number(data.used_tokens);
+    if (Number.isFinite(used)) {
+      turnCost.usedTokens = used;
+      if (used > turnCost.peakTokens) turnCost.peakTokens = used;
+    }
+  }
+  if (data.budget_tokens != null) {
+    const budget = Number(data.budget_tokens);
+    if (Number.isFinite(budget)) turnCost.budgetTokens = budget;
+  }
+  if (data.level) turnCost.level = data.level;
+  renderCostPanel();
+}
+
+function costSummaryMeta() {
+  const parts = [];
+  if (turnCost.step > 0) {
+    parts.push(
+      turnCost.maxSteps
+        ? `${turnCost.step}/${turnCost.maxSteps} 步`
+        : `${turnCost.step} 步`
+    );
+  }
+  if (turnCost.peakTokens > 0) {
+    parts.push(`峰值 ≈ ${formatTok(turnCost.peakTokens)} tok`);
+  } else if (turnCost.usedTokens != null) {
+    parts.push(`≈ ${formatTok(turnCost.usedTokens)} tok`);
+  }
+  return parts.join(" · ");
+}
 
 function setStatus(mode, text) {
   runStatus.className = `run-status ${mode}`;
@@ -151,9 +250,11 @@ function formatContextDetail(data) {
   return `剩余 ${remaining}% · ${scope}`;
 }
 
-function updateContextMeter(data) {
+function updateContextMeter(data, opts) {
   if (!contextRing || !data) return;
+  const syncCost = !opts || opts.syncCost !== false;
   lastContextUsage = data;
+  if (syncCost) noteCostUsage(data);
   const remaining = Math.max(0, Math.min(100, Number(data.remaining_pct)));
   const used = Math.max(0, Math.min(100, Number(data.used_pct ?? 100 - remaining)));
   const level = data.level || (remaining <= 15 ? "critical" : remaining <= 35 ? "warn" : "ok");
@@ -175,15 +276,18 @@ function updateContextMeter(data) {
 
 function resetContextMeter() {
   lastContextUsage = null;
-  updateContextMeter({
-    remaining_pct: 100,
-    used_pct: 0,
-    level: "ok",
-    scope: "turn",
-    hint: "发送任务后显示用量",
-    used_tokens: 0,
-    budget_tokens: null,
-  });
+  updateContextMeter(
+    {
+      remaining_pct: 100,
+      used_pct: 0,
+      level: "ok",
+      scope: "turn",
+      hint: "发送任务后显示用量",
+      used_tokens: 0,
+      budget_tokens: null,
+    },
+    { syncCost: false }
+  );
   if (contextRingDetail) contextRingDetail.textContent = "—%";
   if (contextRing) {
     contextRing.title = "发送任务后显示用量";
@@ -295,6 +399,7 @@ function resetSessionUI() {
   todoList.innerHTML = "";
   todoEmpty.classList.remove("hidden");
   setStatus("idle", "空闲");
+  resetCostPanel(Number(maxStepsInput && maxStepsInput.value) || 30);
   resetContextMeter();
   clearAttachedPaths();
   hideApprovalBar();
@@ -370,12 +475,97 @@ function formatStoppedReason(reason) {
   const map = {
     completed: "已完成",
     max_steps: "达到最大步数",
-    interrupted: "已中断",
-    loop_detected: "检测到循环",
-    retry_exhausted: "重试耗尽",
-    goal_met_forced: "目标已达成（强制收尾）",
+    interrupted: "已按你的要求停止",
+    loop_detected: "检测到重复操作，已停止",
+    retry_exhausted: "多次失败后已停止",
+    goal_met_forced: "测试已通过，已自动结束",
   };
   return map[reason] || reason || "";
+}
+
+function setRunControls(isRunning) {
+  running = isRunning;
+  if (sendBtn) {
+    // Only hide Send while running — do NOT disable it.
+    // A disabled submit button blocks Enter from submitting the form,
+    // which broke mid-run steer.
+    sendBtn.disabled = false;
+    sendBtn.classList.toggle("hidden", isRunning);
+    sendBtn.title = "发送";
+    sendBtn.setAttribute("aria-label", "Send");
+  }
+  if (stopBtn) {
+    stopBtn.classList.toggle("hidden", !isRunning);
+    stopBtn.disabled = false;
+  }
+  if (chatInput) {
+    chatInput.placeholder = isRunning
+      ? "运行中可插话纠偏（回车发送），例如：不要改别的文件，只修测试…"
+      : "Ask something… 或把右侧文件拖进来";
+  }
+}
+
+async function requestStop() {
+  if (!running || !stopBtn) return;
+  stopBtn.disabled = true;
+  setStatus("running", "正在停止…");
+  try {
+    const res = await fetch("/api/stop", { method: "POST" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      addInfoBubble(data.detail || `停止失败：HTTP ${res.status}`);
+      stopBtn.disabled = false;
+      setStatus("running", "运行中…");
+    }
+  } catch (err) {
+    addInfoBubble(String(err));
+    stopBtn.disabled = false;
+    setStatus("running", "运行中…");
+  }
+}
+
+async function sendSteer(taskText) {
+  const typed = (taskText || chatInput.value || "").trim();
+  const task = buildTaskWithAttachments(typed);
+  if (!task) return false;
+  if (!running) {
+    addInfoBubble("当前没有运行中的任务，无法纠偏。请先发送任务。");
+    return false;
+  }
+
+  chatInput.value = "";
+  clearAttachedPaths();
+  addUserBubble(`纠偏：${task}`);
+  setStatus("running", "已插入纠偏，下一步生效…");
+
+  try {
+    const res = await fetch("/api/steer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: task }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const detail =
+        typeof data.detail === "string"
+          ? data.detail
+          : data.detail
+            ? JSON.stringify(data.detail)
+            : `纠偏失败：HTTP ${res.status}`;
+      addInfoBubble(
+        res.status === 409
+          ? "纠偏失败：没有进行中的任务（可能已结束或页面已刷新）。请重新发送任务。"
+          : detail
+      );
+      setStatus("running", "运行中…");
+      return false;
+    }
+    return true;
+  } catch (err) {
+    addInfoBubble(String(err));
+    setStatus("running", "运行中…");
+    return false;
+  }
 }
 
 function addFinalBubble(text, meta) {
@@ -939,8 +1129,33 @@ function handleEvent(data) {
       if (data.session_id) sessionId = data.session_id;
       break;
     case "run_start":
+      resetCostPanel(data.max_steps || Number(maxStepsInput && maxStepsInput.value) || 30);
+      if (data.context_token_budget != null) {
+        noteCostUsage({
+          budget_tokens: data.context_token_budget,
+          used_tokens: turnCost.usedTokens,
+          level: "ok",
+        });
+      }
+      break;
+    case "skill_loaded":
+      {
+        const via = data.via === "keyword_router" ? "关键词预注入" : "load_skill";
+        const hits = Array.isArray(data.matched) && data.matched.length
+          ? ` · hits: ${data.matched.slice(0, 4).join(", ")}`
+          : "";
+        const score = data.score != null ? ` · score=${data.score}` : "";
+        addInfoBubble(`Skill · **${data.name || "?"}**（${via}${score}${hits}）`);
+      }
+      break;
+    case "steer":
+      addInfoBubble(
+        `纠偏已生效（第 ${data.step || "?"} 步）：${escapeHtml(data.text || "")}`
+      );
+      setStatus("running", "运行中…");
       break;
     case "step_start":
+      noteCostStep(data.step, data.max_steps);
       setActiveStep(data.step, data.max_steps);
       break;
     case "think":
@@ -1005,12 +1220,21 @@ function handleEvent(data) {
       break;
     case "done":
       hideApprovalBar();
-      addFinalBubble(
-        data.final_text || "",
-        `${formatStoppedReason(data.stopped_reason)} · ${data.steps} 步` +
-          (data.transcript_id ? ` · ${data.transcript_id}` : "")
-      );
-      setStatus("idle", "完成");
+      if (data.steps != null) noteCostStep(data.steps, turnCost.maxSteps);
+      {
+        const costBit = costSummaryMeta();
+        addFinalBubble(
+          data.final_text || "",
+          `${formatStoppedReason(data.stopped_reason)}` +
+            (costBit ? ` · ${costBit}` : ` · ${data.steps} 步`) +
+            (data.transcript_id ? ` · ${data.transcript_id}` : "")
+        );
+      }
+      if (data.stopped_reason === "interrupted") {
+        setStatus("idle", "已停止");
+      } else {
+        setStatus("idle", "完成");
+      }
       sessionActive = true;
       break;
     case "error":
@@ -1162,6 +1386,18 @@ async function loadMeta() {
   }
   renderSuggestions(data.suggestions || []);
   loadFileTree();
+  // If server still holds a run lock (e.g. after refresh), show Stop
+  try {
+    const h = await fetch("/api/health");
+    const health = await h.json();
+    if (health && health.busy && !running) {
+      setRunControls(true);
+      setStatus("running", "后台仍有任务在跑…");
+      addInfoBubble("检测到未结束的上一轮任务。可点红色「停止」后再发新任务。");
+    }
+  } catch (_) {
+    /* ignore */
+  }
 }
 
 async function loadHistory() {
@@ -1431,14 +1667,19 @@ async function resetDemos() {
 async function startRun(taskText) {
   const typed = (taskText || chatInput.value || "").trim();
   const task = buildTaskWithAttachments(typed);
-  if (!task || running) return;
+  if (!task) return;
+
+  // Running → mid-flight steer instead of starting a second run
+  if (running) {
+    await sendSteer(task);
+    return;
+  }
 
   // Clear composer immediately so sent text / chips do not linger
   chatInput.value = "";
   clearAttachedPaths();
 
-  running = true;
-  sendBtn.disabled = true;
+  setRunControls(true);
   setStatus("running", "运行中…");
   showChat();
 
@@ -1463,6 +1704,7 @@ async function startRun(taskText) {
     changedFiles = new Map();
     renderChangedBar();
     // New turn: clear previous turn's ring until this turn's usage arrives
+    resetCostPanel(Number(maxStepsInput.value) || 30);
     resetContextMeter();
   }
 
@@ -1483,8 +1725,26 @@ async function startRun(taskText) {
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      addInfoBubble(err.detail || `HTTP ${res.status}`);
-      setStatus("err", "已阻塞");
+      const detail = formatApiDetail(err, res);
+      if (res.status === 409) {
+        addInfoBubble(
+          detail ||
+            "上一轮任务仍在执行。请先点红色「停止」，或等本轮结束后再发。"
+        );
+        // Page may have been refreshed while a run was active — show Stop / try clear
+        setRunControls(true);
+        setStatus("running", "检测到未结束任务…");
+        try {
+          await fetch("/api/stop", { method: "POST" });
+          addInfoBubble("已请求停止上一轮。请再发一次任务。");
+        } catch (_) {
+          /* ignore */
+        }
+        setStatus("err", "请重试");
+      } else {
+        addInfoBubble(detail || `HTTP ${res.status}`);
+        setStatus("err", "已阻塞");
+      }
       return;
     }
 
@@ -1510,9 +1770,12 @@ async function startRun(taskText) {
     setStatus("err", "错误");
   } finally {
     hideApprovalBar();
-    running = false;
-    sendBtn.disabled = false;
-    if (runStatus.textContent === "运行中…" || runStatus.textContent === "等待授权…") {
+    setRunControls(false);
+    if (
+      runStatus.textContent === "运行中…" ||
+      runStatus.textContent === "等待授权…" ||
+      runStatus.textContent === "正在停止…"
+    ) {
       setStatus("idle", "空闲");
     }
     loadHistory();
@@ -1605,6 +1868,18 @@ composer.addEventListener("submit", (e) => {
   startRun();
 });
 
+// Belt-and-suspenders: Enter always steers/sends even if submit is quirky
+if (chatInput) {
+  chatInput.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" || e.shiftKey || e.isComposing) return;
+    e.preventDefault();
+    startRun();
+  });
+}
+if (stopBtn) {
+  stopBtn.addEventListener("click", () => requestStop());
+}
+
 if (contextRing) {
   contextRing.addEventListener("click", (e) => {
     e.preventDefault();
@@ -1664,5 +1939,6 @@ historySearch.addEventListener("input", () => renderHistory(historyCache));
 setupComposerDrop();
 loadMeta();
 loadHistory();
+resetCostPanel(Number(maxStepsInput && maxStepsInput.value) || 30);
 resetContextMeter();
 chatInput.focus();

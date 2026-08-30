@@ -138,9 +138,10 @@ def format_turn_summary(
         "completed": "已完成",
         "max_steps": "达到最大步数",
         "interrupted": "已中断",
-        "loop_detected": "检测到循环",
-        "retry_exhausted": "重试耗尽",
-        "goal_met_forced": "目标已达成（强制收尾）",
+        "loop_detected": "检测到重复操作，已停止",
+        "retry_exhausted": "多次失败后已停止",
+        "goal_met_forced": "测试已通过，已自动结束",
+        "interrupted": "已按你的要求停止",
     }.get(stopped_reason, stopped_reason)
 
     lines = [

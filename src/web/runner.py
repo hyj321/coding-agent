@@ -201,6 +201,8 @@ def run_coding_task(
     ask_fn: AskFn | None = None,
     ask_min_risk: str = "medium",
     deny_high: bool | None = None,
+    cancel_event: Any | None = None,
+    steer_inbox: Any | None = None,
 ) -> tuple[AgentResult, Config, Path | None]:
     config = Config.from_env(
         workdir=workdir,
@@ -298,6 +300,8 @@ def run_coding_task(
         prior_memory=prior_memory,
         context_token_budget=config.context_token_budget,
         transcript_dir=config.transcript_dir,
+        cancel_event=cancel_event,
+        steer_inbox=steer_inbox,
     )
 
     transcript_path: Path | None = None
