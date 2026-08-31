@@ -40,7 +40,10 @@ _TRANSIENT_RE = re.compile(
     r"resource\s+(?:busy|temporarily unavailable)|"
     r"\bebusy\b|\beagain\b|"
     r"file\s+is\s+locked|lock(?:ed)?\s+(?:by|held)|"
-    r"try again later|please retry|unavailable \(retry\)"
+    r"try again later|please retry|unavailable \(retry\)|"
+    # Browser / undici / some SDKs: "TypeError: network error"
+    r"network\s*error|failed\s+to\s+fetch|fetch\s+failed|"
+    r"provider unreachable"
     r")",
     re.IGNORECASE,
 )

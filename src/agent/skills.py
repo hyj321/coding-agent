@@ -51,6 +51,15 @@ _ROUTING_KEYWORDS: dict[str, list[tuple[re.Pattern[str], int]]] = {
         (re.compile(r"\brename\b", re.I), 2),
         (re.compile(r"重构|整理代码|抽(?:取|离)|重命名|不改行为", re.I), 3),
     ],
+    "style-transfer": [
+        (re.compile(r"\bstyle\s*card\b", re.I), 4),
+        (re.compile(r"\bstyle\s*transfer\b", re.I), 4),
+        (re.compile(r"\bcode\s*style\b", re.I), 4),
+        (re.compile(r"\bimitate\b.*\bstyle\b", re.I), 3),
+        (re.compile(r"\bwriting\s*style\b", re.I), 3),
+        (re.compile(r"风格卡片|风格迁移|代码风格|学习(?:这个)?风格|模仿(?:这个)?风格|提炼风格|refine_style", re.I), 4),
+        (re.compile(r"save_style|load_style|list_styles", re.I), 3),
+    ],
 }
 
 

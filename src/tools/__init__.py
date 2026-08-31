@@ -17,6 +17,7 @@ from src.tools.rag_search import register_rag_search_tools
 from src.tools.shell import register_shell_tools
 from src.tools.user_ask import UserAskFn, register_user_ask_tools
 from src.tools.skills import register_skill_tools
+from src.tools.styles import register_style_tools
 from src.tools.testing import register_testing_tools
 from src.tools.todo import TodoStore, register_todo_tools
 
@@ -35,6 +36,7 @@ def build_default_registry(
     register_git_tools(registry, gate, max_output_chars=max_output_chars)
     register_todo_tools(registry, TodoStore())
     register_skill_tools(registry)
+    register_style_tools(registry, workdir=gate.workdir, ask_user_fn=ask_user_fn)
     register_user_ask_tools(registry, ask_fn=ask_user_fn)
     register_memory_search_tools(
         registry,

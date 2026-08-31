@@ -1688,6 +1688,7 @@ python -m scripts.smoke_v1
 | **0-2** | Strict Completion | 6 验证 · 10 终止 | `COMPLETION_STRICT=1`：nudge 耗尽 → `stopped_reason=completed_without_evidence`，CLI exit≠0 | 0.5d | [ ] |
 | **0-3** | Live 基线复跑 | 全维 · 9 改进 | `run_suite_eval --live` + capability/decision/cost live → §13 回填 | 0.5d | [ ] |
 | **0-4** | CI / 环境可复现 | 5 执行 · 9 改进 | pin `openai`/`aiohttp`；`PYTHONPATH=.` smoke 入口；避免答辩机 smoke 挂 | 0.5d | [ ] |
+| **0-5** | 文件布局约定 | 4 工具 · 5 执行 | System prompt `4b` + `MEMORY`/`demos/README`：禁止 workdir 根堆文件；非平凡任务用 `apps/<name>/`；UI 对 SSE `TypeError: network error` 给出可操作提示；`LLM_TIMEOUT_SEC` + transient 含 network error | 0.5d | [x] 2026-08-31 |
 
 **Tier 0 验收：**
 
@@ -1779,12 +1780,25 @@ python -m scripts.run_capability_eval --live   # locate steps ≤ 基线+1
 2. **Tier 1-1**：Search-first soft gate（行为层最大缺口）。  
 3. **Tier 0-3**：Live 基线复跑（Imp 从 B+ → 可量化 A-）。
 
+### 14.8b 文件布局缺口（2026-08-31 补录）
+
+> **现象：** 默认 workdir=`demos` 时，Agent 常在根目录堆 `hello.py` / 巨型单文件 app，甚至 `demos/demos/`。  
+> **根因：** `write_file` 只沙箱+自动 mkdir，无「往哪写」约定；prompt/MEMORY 原先强化平铺 demo。  
+> **业界做法：** `AGENTS.md`/`CLAUDE.md`/MEMORY 写目录约定；浅职责树；功能共置；不靠硬 scaffold。  
+> **本仓落地（Tier 0-5）：** prompt `4b` + `demos/.agent/MEMORY.md` + `demos/README.md`；不做强制 scaffold 工具。
+
+### 14.8c `TypeError: network error`（常见）
+
+> **多为 Web SSE 断流：** 浏览器 `fetch` 读流失败 → `TypeError: network error`（Firefox/部分 Chromium）。底层常是 DeepSeek/API 超时、代理/VPN、uvicorn 重启、长任务被中间设备掐断——**不是 Python 业务 TypeError**。  
+> **缓解：** UI 友好文案；`LLM_TIMEOUT_SEC`；transient retry 识别 `network error`；核对 `.env` 的 `BASE_URL`/key；conda 环境用 `codeagent`（基线 env 的 openai/aiohttp 可能不兼容）。
+
 ### 14.9 刻意不做（防 scope 膨胀）
 
 - 浏览器 / 外网检索 / 全 MCP 生态。  
 - 第二 LLM Reflector（成本 + confabulation；已有 Current State + Gate）。  
 - 先上 S1 Docker 再做 Search-first（容器救不了乱读乱停）。  
-- 抬高 `max_steps` 掩盖 pathology（§12 第 5 条）。
+- 抬高 `max_steps` 掩盖 pathology（§12 第 5 条）。  
+- 强制项目 scaffold 模板引擎（约定层足够；硬模板易与任务错配）。
 
 ### 14.10 与 §10 / §8.9 关系
 

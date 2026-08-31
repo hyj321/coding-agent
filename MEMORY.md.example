@@ -12,4 +12,10 @@ into Current State at the start of each task.
 ## Example (hand-written conventions)
 
 - Prefer `edit_file` over rewriting whole files.
-- Demo tests live next to the module (`greeter_test.py`).
+- **File layout:** do not dump new scripts at workdir root.
+  - Non-trivial apps → named subdir (`apps/<name>/`, `src/`, or a package).
+  - One-line smokes → `smoke/` or `_scratch/`.
+  - Tests co-located (`foo_test.py` next to `foo.py`) or under `tests/` mirroring packages.
+  - Never nest the workdir name twice (e.g. `demos/demos/...`).
+- Demo suite fixtures (`greeter.py` / `greeter_test.py`) stay flat by design for Day3 video.
+- **Style cards:** `.agent/styles/<id>.md` — short tone/structure rules; Web Styles 标签勾选后随任务注入；工具 `list_styles` / `load_style` / `save_style` / `delete_style`。

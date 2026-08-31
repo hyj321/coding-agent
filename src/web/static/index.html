@@ -6,8 +6,8 @@
   <title>CodeAgent</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=20260831c9s6" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600&family=Noto+Serif+SC:wght@400;500&family=Source+Serif+4:opsz,wght@8..60,400;8..60,500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css?v=20260831claude1" />
   <script src="https://cdn.jsdelivr.net/npm/marked@15.0.7/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js"></script>
@@ -18,16 +18,11 @@
       <div class="sidebar-top">
         <div class="brand">
           <div class="brand-mark" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="none">
-              <rect x="4" y="5" width="16" height="14" rx="4" stroke="url(#g)" stroke-width="1.8"/>
-              <circle cx="9" cy="11" r="1.3" fill="url(#g)"/>
-              <circle cx="15" cy="11" r="1.3" fill="url(#g)"/>
-              <path d="M9 15h6" stroke="url(#g)" stroke-width="1.6" stroke-linecap="round"/>
-              <defs>
-                <linearGradient id="g" x1="4" y1="5" x2="20" y2="19">
-                  <stop stop-color="#7B5CFF"/><stop offset="1" stop-color="#FF6BCB"/>
-                </linearGradient>
-              </defs>
+            <svg viewBox="0 0 24 24" fill="none" stroke="#c96442" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="4" y="5" width="16" height="14" rx="3.5"/>
+              <circle cx="9" cy="11" r="1.2" fill="#c96442" stroke="none"/>
+              <circle cx="15" cy="11" r="1.2" fill="#c96442" stroke="none"/>
+              <path d="M9 15h6"/>
             </svg>
           </div>
           <span class="brand-name">CodeAgent</span>
@@ -86,7 +81,7 @@
       <div class="workspace">
         <div class="workspace-main">
           <section id="homeView" class="home">
-            <h1 class="hello">Hello <span class="grad">Coder</span></h1>
+            <h1 class="hello">Hello <span class="accent-text">Coder</span></h1>
             <p class="subtitle">How can I help you today?</p>
             <div class="cards" id="suggestionCards"></div>
           </section>
@@ -163,7 +158,7 @@
                 <span class="stop-icon" aria-hidden="true"></span>
               </button>
             </form>
-            <p class="foot-note">拖入右侧文件可作为附件 · Local coding agent · demos in <code>/demos</code></p>
+            <p class="foot-note">拖入右侧文件或 Styles 卡片到输入栏 · Local coding agent · demos in <code>/demos</code></p>
           </footer>
         </div>
 
@@ -171,6 +166,7 @@
           <div class="right-panel-tabs">
             <button type="button" class="rp-tab active" data-tab="files">Files</button>
             <button type="button" class="rp-tab" data-tab="plan">Plan</button>
+            <button type="button" class="rp-tab" data-tab="styles" title="Style cards">Styles</button>
             <button type="button" class="rp-tab" data-tab="caps" title="Tools &amp; permissions">Caps</button>
             <button type="button" id="btnToggleRight" class="rp-collapse" title="Collapse">⟨</button>
           </div>
@@ -181,6 +177,15 @@
           <div id="planPane" class="rp-pane hidden">
             <div id="todoList" class="todo-list"></div>
             <div id="todoEmpty" class="todo-empty">No plan yet — agent will use todo_write.</div>
+          </div>
+          <div id="stylesPane" class="rp-pane hidden">
+            <div class="styles-toolbar">
+              <button type="button" id="btnStyleNew" class="btn-secondary styles-btn">新建</button>
+              <button type="button" id="btnStyleRefresh" class="btn-secondary styles-btn">刷新</button>
+            </div>
+            <p class="styles-hint">勾选=默认启用；也可拖到下方输入栏（像附件）。支持文案与代码风格，可用新样例 refine。</p>
+            <div id="stylesList" class="styles-list"></div>
+            <div id="stylesEmpty" class="styles-empty">暂无风格卡 — 可点「新建」，或让 Agent 从文字/代码提炼（save_style / refine_style）。</div>
           </div>
           <div id="capsPane" class="rp-pane hidden">
             <div id="capsLoading" class="caps-loading">Loading capabilities…</div>
@@ -206,6 +211,48 @@
         </aside>
       </div>
     </main>
+  </div>
+
+  <!-- Style card editor modal -->
+  <div id="styleModal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-backdrop" data-close="style"></div>
+    <div class="modal-card modal-style">
+      <div class="modal-head">
+        <h2 id="styleModalTitle">风格卡片</h2>
+        <button type="button" class="modal-x" data-close="style">×</button>
+      </div>
+      <label class="style-field">
+        <span>ID（短标识）</span>
+        <input id="styleIdInput" type="text" placeholder="product-casual" maxlength="64" />
+      </label>
+      <label class="style-field">
+        <span>标题</span>
+        <input id="styleTitleInput" type="text" placeholder="产品口语风" maxlength="80" />
+      </label>
+      <label class="style-field">
+        <span>类型</span>
+        <select id="styleKindInput">
+          <option value="writing">writing（文案）</option>
+          <option value="code">code（代码）</option>
+          <option value="mixed">mixed</option>
+        </select>
+      </label>
+      <label class="style-field">
+        <span>一句话说明</span>
+        <input id="styleDescInput" type="text" placeholder="何时使用这个风格" maxlength="240" />
+      </label>
+      <label class="style-field">
+        <span>规则正文（短）</span>
+        <textarea id="styleBodyInput" rows="12" placeholder="- 语气：&#10;- 结构：&#10;- 用词：&#10;- 禁忌：&#10;- 样例句："></textarea>
+      </label>
+      <div class="modal-actions style-modal-actions">
+        <button type="button" id="btnStyleDelete" class="btn-danger hidden">删除</button>
+        <div class="modal-actions-right">
+          <button type="button" class="btn-secondary" data-close="style">取消</button>
+          <button type="button" id="btnStyleSave" class="btn-primary">保存</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- Open folder modal -->
@@ -260,6 +307,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=20260831c9s6"></script>
+  <script src="/static/app.js?v=20260831claude1"></script>
 </body>
 </html>

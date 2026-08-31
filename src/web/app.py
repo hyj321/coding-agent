@@ -34,9 +34,16 @@ from src.web.runner import (
     PROJECT_ROOT,
 )
 from src.agent.capabilities import build_capability_snapshot, load_runtime_policies
+from src.agent.styles import (
+    delete_style_card,
+    format_active_styles_preamble,
+    get_style_card,
+    list_style_cards,
+    save_style_card,
+)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-ASSET_VERSION = "20260831c9s6"
+ASSET_VERSION = "20260831styles2"
 
 app = FastAPI(title="CodeAgent", version="0.5.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -62,6 +69,25 @@ class RunRequest(BaseModel):
         default="medium",
         description="Risk level at which Web asks for Allow/Deny (default: medium+).",
     )
+    style_ids: list[str] = Field(
+        default_factory=list,
+        description="Style card ids to inject as Active style cards preamble.",
+    )
+
+
+class StyleUpsertRequest(BaseModel):
+    workdir: str | None = "demos"
+    id: str = Field(..., min_length=1, max_length=64)
+    title: str | None = None
+    description: str = ""
+    body: str = Field(..., min_length=1)
+    kind: str = "writing"
+    overwrite: bool = True
+
+
+class StyleDeleteRequest(BaseModel):
+    workdir: str | None = "demos"
+    id: str = Field(..., min_length=1, max_length=64)
 
 
 class ApproveRequest(BaseModel):
@@ -121,6 +147,7 @@ def meta() -> dict[str, Any]:
             "steer": True,
             "capability_panel": True,
             "ask_user": True,
+            "style_cards": True,
         },
         "suggestions": [
             {
@@ -135,6 +162,14 @@ def meta() -> dict[str, Any]:
                     "阅读 greeter_test.py，修复 greeter.py 使测试全部通过。"
                     "用 todo_write 写 3～5 条阶段计划（可与读文件同轮），"
                     "阶段完成再更新 todo；最后运行 python greeter_test.py 验证。"
+                ),
+            },
+            {
+                "title": "Learn a style card",
+                "desc": "Text or code → save_style / refine_style",
+                "prompt": (
+                    "请学习 greeter.py 的代码风格，用 save_style（kind=code, confirm=true）"
+                    "保存为 id=py-greeter；只写短规则不要整文件。"
                 ),
             },
             {
@@ -174,6 +209,73 @@ def history_detail(transcript_id: str) -> dict[str, Any]:
 @app.post("/api/demos/reset")
 def demos_reset() -> dict[str, Any]:
     return reset_demo_files()
+
+
+@app.get("/api/styles")
+def styles_list(workdir: str = Query(default="demos")) -> dict[str, Any]:
+    try:
+        wd = resolve_workdir(workdir)
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not wd.is_dir():
+        raise HTTPException(status_code=400, detail=f"workdir not found: {wd}")
+    cards = [c.to_dict() for c in list_style_cards(wd)]
+    return {"workdir": str(wd), "items": cards}
+
+
+@app.get("/api/styles/{style_id}")
+def styles_get(style_id: str, workdir: str = Query(default="demos")) -> dict[str, Any]:
+    try:
+        wd = resolve_workdir(workdir)
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        card = get_style_card(wd, style_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if card is None:
+        raise HTTPException(status_code=404, detail=f"style not found: {style_id}")
+    return card.to_dict()
+
+
+@app.post("/api/styles")
+def styles_upsert(body: StyleUpsertRequest) -> dict[str, Any]:
+    try:
+        wd = resolve_workdir(body.workdir or "demos")
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        card = save_style_card(
+            wd,
+            style_id=body.id,
+            name=(body.title or body.id).strip(),
+            description=body.description,
+            body=body.body,
+            kind=body.kind,
+            overwrite=body.overwrite,
+        )
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"ok": True, "card": card.to_dict()}
+
+
+@app.delete("/api/styles/{style_id}")
+def styles_delete(style_id: str, workdir: str = Query(default="demos")) -> dict[str, Any]:
+    try:
+        wd = resolve_workdir(workdir)
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        ok = delete_style_card(wd, style_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"style not found: {style_id}")
+    return {"ok": True, "deleted": style_id}
 
 
 @app.post("/api/workdir")
@@ -401,6 +503,12 @@ async def run_stream(body: RunRequest) -> StreamingResponse:
         _run_lock.release()
         raise HTTPException(status_code=400, detail=f"workdir not found: {wd_path}")
 
+    effective_task = task
+    if body.style_ids:
+        preamble = format_active_styles_preamble(wd_path, list(body.style_ids))
+        if preamble:
+            effective_task = preamble + task
+
     queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
     loop = asyncio.get_running_loop()
     session_id = body.session_id
@@ -433,6 +541,7 @@ async def run_stream(body: RunRequest) -> StreamingResponse:
                     "session_id": session_id,
                     "approval": "ask",
                     "ask_min_risk": ask_min_risk,
+                    "style_ids": list(body.style_ids or []),
                 }
             )
 
@@ -443,7 +552,7 @@ async def run_stream(body: RunRequest) -> StreamingResponse:
                 emit({"type": "log", "text": msg})
 
             result, config, transcript_path = run_coding_task(
-                task=task,
+                task=effective_task,
                 workdir=wd_path,
                 model=body.model,
                 max_steps=body.max_steps,

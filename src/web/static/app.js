@@ -26,6 +26,20 @@ const fileTree = document.getElementById("fileTree");
 const filesWorkdir = document.getElementById("filesWorkdir");
 const filesPane = document.getElementById("filesPane");
 const planPane = document.getElementById("planPane");
+const stylesPane = document.getElementById("stylesPane");
+const stylesList = document.getElementById("stylesList");
+const stylesEmpty = document.getElementById("stylesEmpty");
+const styleModal = document.getElementById("styleModal");
+const styleModalTitle = document.getElementById("styleModalTitle");
+const styleIdInput = document.getElementById("styleIdInput");
+const styleTitleInput = document.getElementById("styleTitleInput");
+const styleDescInput = document.getElementById("styleDescInput");
+const styleKindInput = document.getElementById("styleKindInput");
+const styleBodyInput = document.getElementById("styleBodyInput");
+const btnStyleSave = document.getElementById("btnStyleSave");
+const btnStyleDelete = document.getElementById("btnStyleDelete");
+const btnStyleNew = document.getElementById("btnStyleNew");
+const btnStyleRefresh = document.getElementById("btnStyleRefresh");
 const capsPane = document.getElementById("capsPane");
 const capsLoading = document.getElementById("capsLoading");
 const capsContent = document.getElementById("capsContent");
@@ -58,6 +72,10 @@ const askUserInput = document.getElementById("askUserInput");
 const btnAskUserReply = document.getElementById("btnAskUserReply");
 
 let running = false;
+/** @type {Set<string>} */
+let selectedStyleIds = new Set();
+let styleEditorMode = "create"; // create | edit
+let styleCardsCache = [];
 let pendingApprovalId = null;
 let pendingApprovalCallId = null;
 let pendingAskUserId = null;
@@ -75,6 +93,8 @@ let changedFiles = new Map();
 let projectRoot = "";
 /** path -> { path, kind: "file"|"dir" } — dragged into composer */
 let attachedPaths = new Map();
+/** styleId -> { id, name, kind: "style", styleKind } — dragged style cards */
+let attachedStyles = new Map();
 let monacoReady = null;
 let monacoEditor = null;
 let monacoDiff = null;
@@ -650,7 +670,7 @@ function setRunControls(isRunning) {
   if (chatInput) {
     chatInput.placeholder = isRunning
       ? "运行中可插话纠偏（回车发送），例如：不要改别的文件，只修测试…"
-      : "Ask something… 或把右侧文件拖进来";
+      : "Ask something… 可拖入右侧文件或 Styles 卡片";
   }
 }
 
@@ -1834,19 +1854,57 @@ function removeAttachedPath(path) {
   renderAttachChips();
 }
 
+function addAttachedStyle(card) {
+  if (!card || !card.id) return;
+  attachedStyles.set(card.id, {
+    id: card.id,
+    name: card.name || card.id,
+    kind: "style",
+    styleKind: card.kind || "writing",
+  });
+  selectedStyleIds.add(card.id);
+  persistSelectedStyles();
+  renderAttachChips();
+  renderStylesList();
+}
+
+function removeAttachedStyle(id) {
+  attachedStyles.delete(id);
+  renderAttachChips();
+}
+
 function clearAttachedPaths() {
   attachedPaths = new Map();
+  attachedStyles = new Map();
   renderAttachChips();
 }
 
 function renderAttachChips() {
   if (!attachChips) return;
   attachChips.innerHTML = "";
-  if (!attachedPaths.size) {
+  if (!attachedPaths.size && !attachedStyles.size) {
     attachChips.classList.add("hidden");
     return;
   }
   attachChips.classList.remove("hidden");
+  for (const item of attachedStyles.values()) {
+    const chip = document.createElement("span");
+    chip.className = "attach-chip is-style";
+    chip.title = `style:${item.id}`;
+    const label = document.createElement("span");
+    label.className = "attach-chip-name";
+    const badge = item.styleKind === "code" ? "💻" : "🎨";
+    label.textContent = `${badge} ${item.name} (${item.id})`;
+    const x = document.createElement("button");
+    x.type = "button";
+    x.className = "attach-chip-x";
+    x.setAttribute("aria-label", `Remove style ${item.id}`);
+    x.textContent = "×";
+    x.addEventListener("click", () => removeAttachedStyle(item.id));
+    chip.appendChild(label);
+    chip.appendChild(x);
+    attachChips.appendChild(chip);
+  }
   for (const item of attachedPaths.values()) {
     const chip = document.createElement("span");
     chip.className = `attach-chip${item.kind === "dir" ? " is-dir" : ""}`;
@@ -1868,10 +1926,23 @@ function renderAttachChips() {
 
 function buildTaskWithAttachments(userText) {
   const text = String(userText || "").trim();
-  if (!attachedPaths.size) return text;
-  const lines = ["请重点关注以下附件（相对 workdir；请先 read_file / list_dir 了解内容）："];
-  for (const item of attachedPaths.values()) {
-    lines.push(`- ${item.kind === "dir" ? "[dir] " : ""}${item.path}`);
+  const hasFiles = attachedPaths.size > 0;
+  const hasStyles = attachedStyles.size > 0;
+  if (!hasFiles && !hasStyles) return text;
+
+  const lines = [];
+  if (hasStyles) {
+    lines.push("本回合请遵循以下风格卡片（已附加；写代码/文案时对齐）：");
+    for (const s of attachedStyles.values()) {
+      lines.push(`- [style:${s.styleKind}] ${s.id} — ${s.name}`);
+    }
+  }
+  if (hasFiles) {
+    if (lines.length) lines.push("");
+    lines.push("请重点关注以下附件（相对 workdir；请先 read_file / list_dir 了解内容）：");
+    for (const item of attachedPaths.values()) {
+      lines.push(`- ${item.kind === "dir" ? "[dir] " : ""}${item.path}`);
+    }
   }
   if (text) {
     lines.push("");
@@ -1879,9 +1950,19 @@ function buildTaskWithAttachments(userText) {
     lines.push(text);
   } else {
     lines.push("");
-    lines.push("请根据上述附件理解上下文并等待进一步指示；若需求已隐含在文件中，请合理处理。");
+    lines.push(
+      hasStyles && !hasFiles
+        ? "请按上述风格等待具体改写/编码指示；若需求已隐含，请合理处理。"
+        : "请根据上述附件理解上下文并等待进一步指示；若需求已隐含在文件中，请合理处理。"
+    );
   }
   return lines.join("\n");
+}
+
+function collectStyleIdsForRun() {
+  const ids = new Set(selectedStyleIds);
+  for (const id of attachedStyles.keys()) ids.add(id);
+  return Array.from(ids);
 }
 
 function setupComposerDrop() {
@@ -1912,6 +1993,21 @@ function setupComposerDrop() {
       e.preventDefault();
       dragDepth = 0;
       setDropHighlight(false);
+
+      const styleRaw = e.dataTransfer?.getData("application/x-codeagent-style");
+      if (styleRaw) {
+        try {
+          const parsed = JSON.parse(styleRaw);
+          if (parsed && parsed.id) {
+            addAttachedStyle(parsed);
+            chatInput?.focus();
+            return;
+          }
+        } catch (_) {
+          /* fall through */
+        }
+      }
+
       let path = "";
       let kind = "file";
       const raw = e.dataTransfer?.getData("application/x-codeagent-path");
@@ -1925,7 +2021,8 @@ function setupComposerDrop() {
         }
       }
       if (!path) path = e.dataTransfer?.getData("text/plain") || "";
-      if (path) {
+      // Ignore plain style:id text if somehow set
+      if (path && !path.startsWith("style:")) {
         addAttachedPath(path, kind);
         chatInput?.focus();
       }
@@ -2007,6 +2104,7 @@ async function startRun(taskText) {
     workdir: workdirInput.value.trim() || "demos",
     max_steps: Number(maxStepsInput.value) || 30,
     session_id: sessionId,
+    style_ids: collectStyleIdsForRun(),
   };
 
   try {
@@ -2058,7 +2156,7 @@ async function startRun(taskText) {
       }
     }
   } catch (err) {
-    addInfoBubble(String(err));
+    addInfoBubble(formatRunNetworkError(err));
     setStatus("err", "错误");
   } finally {
     hideApprovalBar();
@@ -2073,7 +2171,27 @@ async function startRun(taskText) {
     }
     loadHistory();
     loadFileTree();
+    loadStyles();
   }
+}
+
+/** Map opaque browser fetch failures to an actionable Chinese message. */
+function formatRunNetworkError(err) {
+  const raw = String(err && err.message != null ? err.message : err || "");
+  const lower = raw.toLowerCase();
+  const looksNetwork =
+    err instanceof TypeError ||
+    /network\s*error|failed to fetch|fetch failed|networkerror|load failed/.test(
+      lower
+    );
+  if (looksNetwork) {
+    return (
+      "网络中断：与本机 Web 服务的流式连接断开（常见原因：DeepSeek/API 超时、代理/VPN、服务重启、或长任务被中间设备掐断）。" +
+      "请确认 uvicorn 仍在运行、.env 的 BASE_URL/API key 可用，然后点「停止」后再重试。" +
+      (raw ? `（原始：${raw}）` : "")
+    );
+  }
+  return raw || String(err);
 }
 
 /* —— Open folder modal —— */
@@ -2133,6 +2251,7 @@ async function selectFolder() {
     workdirInput.dataset.touched = "1";
     folderModal.classList.add("hidden");
     loadFileTree();
+    loadStyles();
     switchRightTab("files");
     workspace.classList.remove("right-collapsed");
   } catch (err) {
@@ -2146,8 +2265,201 @@ function switchRightTab(name) {
   });
   filesPane.classList.toggle("hidden", name !== "files");
   planPane.classList.toggle("hidden", name !== "plan");
+  if (stylesPane) stylesPane.classList.toggle("hidden", name !== "styles");
   capsPane.classList.toggle("hidden", name !== "caps");
   if (name === "caps") loadCapabilities();
+  if (name === "styles") loadStyles();
+}
+
+function styleStorageKey() {
+  const wd = (workdirInput && workdirInput.value.trim()) || "demos";
+  return `codeagent.activeStyles:${wd}`;
+}
+
+function restoreSelectedStyles() {
+  selectedStyleIds = new Set();
+  try {
+    const raw = localStorage.getItem(styleStorageKey());
+    if (!raw) return;
+    const arr = JSON.parse(raw);
+    if (Array.isArray(arr)) arr.forEach((id) => selectedStyleIds.add(String(id)));
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function persistSelectedStyles() {
+  try {
+    localStorage.setItem(
+      styleStorageKey(),
+      JSON.stringify(Array.from(selectedStyleIds))
+    );
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+async function loadStyles() {
+  if (!stylesList) return;
+  const wd = (workdirInput && workdirInput.value.trim()) || "demos";
+  restoreSelectedStyles();
+  try {
+    const res = await fetch(`/api/styles?workdir=${encodeURIComponent(wd)}`);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || res.status);
+    styleCardsCache = data.items || [];
+    // Drop selections that no longer exist
+    const valid = new Set(styleCardsCache.map((c) => c.id));
+    selectedStyleIds = new Set(
+      [...selectedStyleIds].filter((id) => valid.has(id))
+    );
+    persistSelectedStyles();
+    renderStylesList();
+  } catch (err) {
+    stylesList.innerHTML = `<div class="styles-empty">加载失败：${escHtml(
+      err.message || err
+    )}</div>`;
+    if (stylesEmpty) stylesEmpty.classList.add("hidden");
+  }
+}
+
+function renderStylesList() {
+  if (!stylesList) return;
+  if (!styleCardsCache.length) {
+    stylesList.innerHTML = "";
+    if (stylesEmpty) stylesEmpty.classList.remove("hidden");
+    return;
+  }
+  if (stylesEmpty) stylesEmpty.classList.add("hidden");
+  stylesList.innerHTML = styleCardsCache
+    .map((c) => {
+      const checked = selectedStyleIds.has(c.id) ? "checked" : "";
+      const kindLabel = c.kind || "writing";
+      return `<div class="style-card-row" data-id="${escHtml(c.id)}" draggable="true" title="拖到输入栏附加此风格">
+        <label class="style-check">
+          <input type="checkbox" data-style-toggle="${escHtml(c.id)}" ${checked} />
+          <span class="style-check-mark"></span>
+        </label>
+        <button type="button" class="style-card-main" data-style-edit="${escHtml(c.id)}">
+          <span class="style-card-title">${escHtml(c.name || c.id)} <em class="style-kind-tag">${escHtml(kindLabel)}</em></span>
+          <span class="style-card-id">${escHtml(c.id)} · 可拖到输入栏</span>
+          <span class="style-card-desc">${escHtml(c.description || "")}</span>
+        </button>
+      </div>`;
+    })
+    .join("");
+
+  stylesList.querySelectorAll(".style-card-row").forEach((row) => {
+    row.addEventListener("dragstart", (e) => {
+      const id = row.getAttribute("data-id");
+      const card = styleCardsCache.find((c) => c.id === id);
+      if (!card || !e.dataTransfer) return;
+      const payload = JSON.stringify({
+        id: card.id,
+        name: card.name,
+        kind: card.kind || "writing",
+      });
+      e.dataTransfer.setData("application/x-codeagent-style", payload);
+      e.dataTransfer.setData("text/plain", `style:${card.id}`);
+      e.dataTransfer.effectAllowed = "copy";
+      row.classList.add("is-dragging");
+    });
+    row.addEventListener("dragend", () => row.classList.remove("is-dragging"));
+  });
+
+  stylesList.querySelectorAll("[data-style-toggle]").forEach((el) => {
+    el.addEventListener("change", () => {
+      const id = el.getAttribute("data-style-toggle");
+      if (!id) return;
+      if (el.checked) selectedStyleIds.add(id);
+      else selectedStyleIds.delete(id);
+      persistSelectedStyles();
+    });
+  });
+  stylesList.querySelectorAll("[data-style-edit]").forEach((el) => {
+    el.addEventListener("click", () => {
+      const id = el.getAttribute("data-style-edit");
+      const card = styleCardsCache.find((c) => c.id === id);
+      if (card) openStyleEditor(card);
+    });
+  });
+}
+
+function openStyleEditor(card) {
+  if (!styleModal) return;
+  styleEditorMode = card ? "edit" : "create";
+  if (styleModalTitle) {
+    styleModalTitle.textContent = card ? "编辑风格卡片" : "新建风格卡片";
+  }
+  if (styleIdInput) {
+    styleIdInput.value = card ? card.id : "";
+    styleIdInput.readOnly = !!card;
+  }
+  if (styleTitleInput) styleTitleInput.value = card ? card.name || "" : "";
+  if (styleDescInput) styleDescInput.value = card ? card.description || "" : "";
+  if (styleKindInput) styleKindInput.value = card ? card.kind || "writing" : "writing";
+  if (styleBodyInput) styleBodyInput.value = card ? card.body || "" : "";
+  if (btnStyleDelete) btnStyleDelete.classList.toggle("hidden", !card);
+  styleModal.classList.remove("hidden");
+}
+
+async function saveStyleFromModal() {
+  const wd = (workdirInput && workdirInput.value.trim()) || "demos";
+  const id = (styleIdInput && styleIdInput.value.trim()) || "";
+  const title = (styleTitleInput && styleTitleInput.value.trim()) || id;
+  const description = (styleDescInput && styleDescInput.value.trim()) || "";
+  const kind = (styleKindInput && styleKindInput.value.trim()) || "writing";
+  const body = (styleBodyInput && styleBodyInput.value.trim()) || "";
+  if (!id || !body) {
+    alert("请填写 ID 和规则正文");
+    return;
+  }
+  try {
+    const res = await fetch("/api/styles", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        workdir: wd,
+        id,
+        title,
+        description,
+        body,
+        kind,
+        overwrite: true,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || res.status);
+    styleModal.classList.add("hidden");
+    selectedStyleIds.add(id);
+    persistSelectedStyles();
+    await loadStyles();
+    addInfoBubble(`已保存风格卡 \`${id}\``);
+  } catch (err) {
+    alert("保存失败：" + (err.message || err));
+  }
+}
+
+async function deleteStyleFromModal() {
+  const wd = (workdirInput && workdirInput.value.trim()) || "demos";
+  const id = (styleIdInput && styleIdInput.value.trim()) || "";
+  if (!id) return;
+  if (!confirm(`删除风格卡「${id}」？`)) return;
+  try {
+    const res = await fetch(
+      `/api/styles/${encodeURIComponent(id)}?workdir=${encodeURIComponent(wd)}`,
+      { method: "DELETE" }
+    );
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || res.status);
+    selectedStyleIds.delete(id);
+    persistSelectedStyles();
+    styleModal.classList.add("hidden");
+    await loadStyles();
+    addInfoBubble(`已删除风格卡 \`${id}\``);
+  } catch (err) {
+    alert("删除失败：" + (err.message || err));
+  }
 }
 
 function escHtml(text) {
@@ -2230,6 +2542,7 @@ async function loadCapabilities() {
 
 function closeModal(which) {
   if (which === "folder") folderModal.classList.add("hidden");
+  if (which === "style" && styleModal) styleModal.classList.add("hidden");
   if (which === "code" || which === "diff") {
     codeModal.classList.add("hidden");
     disposeMonacoEditors();
@@ -2263,6 +2576,7 @@ if (contextRing) {
 workdirInput.addEventListener("change", () => {
   workdirInput.dataset.touched = "1";
   loadFileTree();
+  loadStyles();
   if (capsPane && !capsPane.classList.contains("hidden")) loadCapabilities();
 });
 workdirInput.addEventListener("input", () => {
@@ -2308,6 +2622,19 @@ document.querySelectorAll(".rp-tab").forEach((tab) => {
   tab.addEventListener("click", () => switchRightTab(tab.dataset.tab));
 });
 
+if (btnStyleNew) {
+  btnStyleNew.addEventListener("click", () => openStyleEditor(null));
+}
+if (btnStyleRefresh) {
+  btnStyleRefresh.addEventListener("click", () => loadStyles());
+}
+if (btnStyleSave) {
+  btnStyleSave.addEventListener("click", () => saveStyleFromModal());
+}
+if (btnStyleDelete) {
+  btnStyleDelete.addEventListener("click", () => deleteStyleFromModal());
+}
+
 document.querySelectorAll("[data-close]").forEach((el) => {
   el.addEventListener("click", () => closeModal(el.getAttribute("data-close")));
 });
@@ -2324,6 +2651,7 @@ historySearch.addEventListener("input", () => renderHistory(historyCache));
 setupComposerDrop();
 loadMeta();
 loadHistory();
+loadStyles();
 resetCostPanel(Number(maxStepsInput && maxStepsInput.value) || 30);
 resetContextMeter();
 chatInput.focus();

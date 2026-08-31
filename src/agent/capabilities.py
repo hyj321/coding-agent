@@ -31,6 +31,11 @@ _TOOL_CATEGORIES: dict[str, str] = {
     "todo_write": "Orchestration",
     "load_skill": "Orchestration",
     "ask_user": "Orchestration",
+    "list_styles": "Style",
+    "load_style": "Style",
+    "save_style": "Style",
+    "refine_style": "Style",
+    "delete_style": "Style",
     "memory_search": "Memory",
     "rag_search": "Memory",
 }
