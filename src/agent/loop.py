@@ -26,7 +26,13 @@ from src.agent.memory import (
     save_working_memory,
 )
 from src.agent.permissions import PermissionGate
-from src.agent.retry_policy import RetryPolicy
+from src.agent.retry_policy import (
+    RetryPolicy,
+    call_with_transient_retry,
+    classify_failure,
+    format_failure_suffix,
+    transient_exhausted_suffix,
+)
 from src.agent.skills import format_skill_preload, suggest_skills
 from src.agent.steer import SteerInbox, format_steer_message
 from src.agent.stop_conditions import (
@@ -798,9 +804,47 @@ def run_agent(
                         result = f"错误：权限门拒绝了该工具 — {decision.reason}"
                         log(f"[deny] {result}")
                     else:
-                        result = registry.dispatch(name, parsed)
+                        result, tr = call_with_transient_retry(
+                            lambda: registry.dispatch(name, parsed),
+                            sleep_fn=lambda _s: None,  # keep tool path snappy in-loop
+                        )
+                        if tr.attempts > 1:
+                            log(
+                                f"[retry_policy] transient tool attempts={tr.attempts} "
+                                f"recovered={tr.recovered} tool={name}"
+                            )
+                            emit(
+                                {
+                                    "type": "transient_retry",
+                                    "step": step,
+                                    "id": call_id,
+                                    "name": name,
+                                    "attempts": tr.attempts,
+                                    "recovered": tr.recovered,
+                                    "kind": tr.kind,
+                                }
+                            )
                 else:
-                    result = registry.dispatch(name, parsed)
+                    result, tr = call_with_transient_retry(
+                        lambda: registry.dispatch(name, parsed),
+                        sleep_fn=lambda _s: None,
+                    )
+                    if tr.attempts > 1:
+                        log(
+                            f"[retry_policy] transient tool attempts={tr.attempts} "
+                            f"recovered={tr.recovered} tool={name}"
+                        )
+                        emit(
+                            {
+                                "type": "transient_retry",
+                                "step": step,
+                                "id": call_id,
+                                "name": name,
+                                "attempts": tr.attempts,
+                                "recovered": tr.recovered,
+                                "kind": tr.kind,
+                            }
+                        )
 
                 stored = result
                 if ctx is not None and not reused:
@@ -901,41 +945,74 @@ def run_agent(
                     step_had_failure = True
                 elif not ok:
                     step_had_failure = True
-                    retry_decision = retry_policy.record_failure(
-                        tool_name=name,
-                        args=parsed if isinstance(parsed, dict) else None,
-                        result=str(body_for_ok),
-                    )
-                    if retry_decision.should_stop:
-                        retry_policy.ban_fingerprint(fp)
-                    if ctx is not None:
-                        ctx._sync_task_retry_fields()
-                    log(
-                        f"[retry_policy] key={retry_decision.key} "
-                        f"stage={retry_decision.stage}/{retry_policy.max_failures} "
-                        f"count={retry_decision.count}"
-                        f"{' BAN' if retry_decision.should_stop else ''}"
-                    )
-                    emit(
-                        {
-                            "type": "retry_stage",
-                            "step": step,
-                            "name": name,
-                            "failure_key": retry_decision.key,
-                            "stage": retry_decision.stage,
-                            "count": retry_decision.count,
-                            "max_failures": retry_policy.max_failures,
-                            "will_stop": False,
-                            "banned": retry_decision.should_stop,
-                            "failed_strategies": [
-                                s.to_dict() for s in list(retry_policy.by_key.values())[:8]
-                            ],
-                        }
-                    )
-                    if retry_decision.suffix:
-                        stored = f"{stored}{retry_decision.suffix}"
-                    # Dec-A: exhausted → ban fingerprint; hard stop waits for next
-                    # same-fp dispatch (BLOCK). Model may switch strategy on this turn.
+                    fail_kind = classify_failure(result=str(body_for_ok)) or "semantic"
+                    if fail_kind == "format":
+                        stored = f"{stored}{format_failure_suffix(tool_name=name)}"
+                        log(f"[retry_policy] format failure tool={name} (no strategy ban)")
+                        emit(
+                            {
+                                "type": "retry_stage",
+                                "step": step,
+                                "name": name,
+                                "failure_kind": "format",
+                                "banned": False,
+                                "will_stop": False,
+                            }
+                        )
+                    elif fail_kind == "transient":
+                        # Auto-retry already exhausted inside dispatch wrapper
+                        stored = f"{stored}{transient_exhausted_suffix(tool_name=name, attempts=1)}"
+                        log(f"[retry_policy] transient exhausted tool={name} (no strategy ban)")
+                        emit(
+                            {
+                                "type": "retry_stage",
+                                "step": step,
+                                "name": name,
+                                "failure_kind": "transient",
+                                "banned": False,
+                                "will_stop": False,
+                            }
+                        )
+                    else:
+                        retry_decision = retry_policy.record_failure(
+                            tool_name=name,
+                            args=parsed if isinstance(parsed, dict) else None,
+                            result=str(body_for_ok),
+                            kind="semantic",
+                        )
+                        if retry_decision is not None:
+                            if retry_decision.should_stop:
+                                retry_policy.ban_fingerprint(fp)
+                            if ctx is not None:
+                                ctx._sync_task_retry_fields()
+                            log(
+                                f"[retry_policy] kind=semantic key={retry_decision.key} "
+                                f"stage={retry_decision.stage}/{retry_policy.max_failures} "
+                                f"count={retry_decision.count}"
+                                f"{' BAN' if retry_decision.should_stop else ''}"
+                            )
+                            emit(
+                                {
+                                    "type": "retry_stage",
+                                    "step": step,
+                                    "name": name,
+                                    "failure_kind": "semantic",
+                                    "failure_key": retry_decision.key,
+                                    "stage": retry_decision.stage,
+                                    "count": retry_decision.count,
+                                    "max_failures": retry_policy.max_failures,
+                                    "will_stop": False,
+                                    "banned": retry_decision.should_stop,
+                                    "failed_strategies": [
+                                        s.to_dict()
+                                        for s in list(retry_policy.by_key.values())[:8]
+                                    ],
+                                }
+                            )
+                            if retry_decision.suffix:
+                                stored = f"{stored}{retry_decision.suffix}"
+                        # Dec-A/E3: exhausted → ban fingerprint; hard stop waits for
+                        # next same-fp dispatch (BLOCK). No strategy auto-replay.
 
                 # After tests-passed nudge only: mutating tools may escalate to force-stop
                 if (

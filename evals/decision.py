@@ -132,6 +132,66 @@ def _run_no_false_cycle() -> DecisionReport:
     )
 
 
+def _run_e3_transient_no_ban() -> DecisionReport:
+    """E3: transient errors auto-retry and never enter failure_key ban."""
+    from src.agent.retry_policy import RetryPolicy, call_with_transient_retry, classify_failure
+
+    assert classify_failure(result="Error: 429 rate limit") == "transient"
+    box = {"n": 0}
+
+    def flaky() -> str:
+        box["n"] += 1
+        if box["n"] < 2:
+            return "Error: connection reset by peer"
+        return "recovered"
+
+    out, report = call_with_transient_retry(
+        flaky, max_extra=2, backoff_sec=0, sleep_fn=lambda _s: None
+    )
+    rp = RetryPolicy(max_failures=3)
+    skipped = rp.record_failure(
+        tool_name="run_shell",
+        args={"command": "x"},
+        result="Error: 429 rate limit",
+        kind="transient",
+    )
+    ok = (
+        out == "recovered"
+        and report.recovered
+        and skipped is None
+        and not rp.blocked_fingerprints
+        and not rp.by_key
+    )
+    return DecisionReport(
+        case_id="decision:e3-transient-no-ban",
+        success=ok,
+        blocked_replays=0,
+        notes=[f"attempts={report.attempts}", "transient not banned"],
+    )
+
+
+def _run_e3_strategy_block() -> DecisionReport:
+    """E3: semantic/strategy failures ban fingerprint — no same-fp auto-replay."""
+    rp = RetryPolicy(max_failures=3)
+    args = {"path": "x.py", "old_string": "a", "new_string": "b"}
+    for _ in range(3):
+        d = rp.record_failure(
+            tool_name="edit_file", args=args, result="Error: still broken"
+        )
+        assert d is not None
+    fp = tool_call_fingerprint("edit_file", args)
+    rp.ban_fingerprint(fp)
+    msg = rp.blocked_tool_message("edit_file")
+    ok = rp.is_blocked(fp) and msg.startswith("Error: BLOCKED") and rp.block_hits >= 1
+    return DecisionReport(
+        case_id="decision:e3-strategy-block",
+        success=ok,
+        blocked_replays=rp.block_hits,
+        stopped_reason="retry_exhausted",
+        notes=["semantic failures → ban → BLOCK; no strategy auto-replay"],
+    )
+
+
 def score_decision_offline() -> list[DecisionReport]:
     """All Dec-C offline fixtures (assertable by smoke / CLI)."""
     return [
@@ -139,6 +199,8 @@ def score_decision_offline() -> list[DecisionReport]:
         _run_block(),
         _run_stagnation_warn_only(),
         _run_no_false_cycle(),
+        _run_e3_transient_no_ban(),
+        _run_e3_strategy_block(),
     ]
 
 

@@ -1,21 +1,75 @@
 """Staged retry policy: same failure strategy → escalate → stop.
 
-Harness only injects constraints and counts; it does not auto-re-run tools.
+E3 taxonomy (Anatomy of Termination / M-D4):
+  * transient — API/429/timeout/file-lock: harness may auto-retry a few times;
+    does **not** enter failure_key / fingerprint ban.
+  * format — bad JSON/args: return error to model; do not ban strategy.
+  * semantic / strategy — wrong outcome or same-args repeat: record_failure →
+    ban fingerprint → hard BLOCK on next same call (no auto-replay).
+
+Harness never auto-re-runs a **strategy** failure with the same fingerprint.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable, Literal
 
+FailureKind = Literal["transient", "format", "semantic"]
 
 _ERROR_CLASS = re.compile(
     r"\b([A-Z][A-Za-z0-9]*(?:Error|Exception|Warning))\b"
 )
 _TEST_NODE = re.compile(r"(?m)^(?:FAILED|ERROR)\s+(\S+::\S+)")
 _GENERIC_ERROR = re.compile(r"(?i)^Error:\s*(.{0,80})")
+
+# Network / rate-limit / timeout / lock-ish (tool text or exception message)
+_TRANSIENT_RE = re.compile(
+    r"(?:"
+    r"\b429\b|rate[\s_-]?limit|too many requests|"
+    r"timeout(?:error)?|timed?\s*out|deadline exceeded|"
+    r"ratelimiterror|apiconnectionerror|apitimeouterror|"
+    r"temporar(?:y|ily)\s+(?:unavailable|busy)|"
+    r"service unavailable|\b503\b|\b502\b|\b504\b|"
+    r"connection\s+(?:reset|aborted|refused|error)|"
+    r"econnreset|etimedout|econnrefused|"
+    r"winerror\s*32|being used by another process|"
+    r"resource\s+(?:busy|temporarily unavailable)|"
+    r"\bebusy\b|\beagain\b|"
+    r"file\s+is\s+locked|lock(?:ed)?\s+(?:by|held)|"
+    r"try again later|please retry|unavailable \(retry\)"
+    r")",
+    re.IGNORECASE,
+)
+
+_TRANSIENT_EXC_NAMES = frozenset(
+    {
+        "APITimeoutError",
+        "APIConnectionError",
+        "RateLimitError",
+        "InternalServerError",
+        "APIStatusError",
+        "TimeoutError",
+        "ConnectTimeout",
+        "ReadTimeout",
+        "ConnectionError",
+        "BrokenPipeError",
+    }
+)
+
+_FORMAT_RE = re.compile(
+    r"(?:"
+    r"invalid\s+json|json\.?decode|expecting value|"
+    r"arguments must|missing required|unknown tool|"
+    r"must be a (?:string|object|number|boolean|array)|"
+    r"type must|not a valid|"
+    r"could not parse|malformed"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def extract_error_class(result: str) -> str:
@@ -38,6 +92,172 @@ def extract_error_class(result: str) -> str:
     if text.strip().startswith("Error"):
         return "Error"
     return "fail"
+
+
+def is_transient_text(text: str) -> bool:
+    return bool(_TRANSIENT_RE.search(text or ""))
+
+
+def is_transient_exception(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    if name in _TRANSIENT_EXC_NAMES:
+        return True
+    # openai.APIStatusError often carries status_code
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status in {408, 409, 425, 429, 500, 502, 503, 504}:
+        return True
+    return is_transient_text(f"{name}: {exc}")
+
+
+def is_format_failure(text: str) -> bool:
+    t = text or ""
+    if _FORMAT_RE.search(t):
+        return True
+    # Common harness parse / schema rejects
+    if re.search(r"(?i)^Error:.*\b(?:json|argument|parameter|schema)\b", t):
+        return True
+    return False
+
+
+def classify_failure(
+    *,
+    result: str = "",
+    exc: BaseException | None = None,
+) -> FailureKind | None:
+    """Classify a failed tool/LLM outcome. None = not a failure / unknown ok path."""
+    if exc is not None:
+        if is_transient_exception(exc):
+            return "transient"
+        msg = f"{type(exc).__name__}: {exc}"
+        if is_format_failure(msg):
+            return "format"
+        return "semantic"
+    text = result or ""
+    if not text.strip():
+        return None
+    # Success-ish tool bodies
+    if not (
+        text.startswith("Error")
+        or text.startswith("错误")
+        or re.search(r"(?m)^(FAILED|ERROR)\b", text)
+        or re.search(r"exit_code:\s*[1-9]", text)
+    ):
+        return None
+    # Auth deny / parse: not a strategy fingerprint burn
+    if "权限门" in text or re.search(r"(?i)permission.*den", text):
+        return "format"
+    if is_transient_text(text):
+        return "transient"
+    if is_format_failure(text):
+        return "format"
+    return "semantic"
+
+
+def transient_retry_defaults() -> tuple[int, float]:
+    """Return (max_extra_attempts, backoff_sec) from env."""
+    extra = int(os.getenv("TRANSIENT_RETRY_MAX", "2") or "2")
+    if extra < 0:
+        extra = 0
+    if extra > 5:
+        extra = 5
+    ms = int(os.getenv("TRANSIENT_RETRY_BACKOFF_MS", "200") or "200")
+    if ms < 0:
+        ms = 0
+    return extra, ms / 1000.0
+
+
+@dataclass
+class TransientRetryReport:
+    attempts: int
+    recovered: bool
+    kind: FailureKind | None
+    last_error: str = ""
+
+
+def call_with_transient_retry(
+    fn: Callable[[], Any],
+    *,
+    max_extra: int | None = None,
+    backoff_sec: float | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
+    is_result_transient: Callable[[Any], bool] | None = None,
+) -> tuple[Any, TransientRetryReport]:
+    """Run ``fn``; on transient exception/result, retry up to max_extra times.
+
+    Non-transient failures return immediately (no harness strategy auto-replay).
+    """
+    extra, default_backoff = transient_retry_defaults()
+    if max_extra is None:
+        max_extra = extra
+    if backoff_sec is None:
+        backoff_sec = default_backoff
+    sleeper = sleep_fn or time.sleep
+
+    attempts = 0
+    last_err = ""
+    last_kind: FailureKind | None = None
+    total = max(1, int(max_extra) + 1)
+
+    while attempts < total:
+        attempts += 1
+        try:
+            value = fn()
+        except Exception as exc:  # noqa: BLE001 — classify then maybe retry
+            last_kind = classify_failure(exc=exc)
+            last_err = f"{type(exc).__name__}: {exc}"
+            if last_kind == "transient" and attempts < total:
+                sleeper(backoff_sec * attempts)
+                continue
+            raise
+
+        # Optional: treat returned Error strings as retryable
+        if is_result_transient is not None and is_result_transient(value):
+            last_kind = "transient"
+            last_err = str(value)[:220]
+            if attempts < total:
+                sleeper(backoff_sec * attempts)
+                continue
+            return value, TransientRetryReport(
+                attempts=attempts,
+                recovered=False,
+                kind="transient",
+                last_error=last_err,
+            )
+
+        if isinstance(value, str):
+            kind = classify_failure(result=value)
+            if kind == "transient" and attempts < total:
+                last_kind = kind
+                last_err = value[:220]
+                sleeper(backoff_sec * attempts)
+                continue
+
+        return value, TransientRetryReport(
+            attempts=attempts,
+            recovered=attempts > 1 and last_kind == "transient",
+            kind=None if attempts == 1 else last_kind,
+            last_error=last_err,
+        )
+
+    # Unreachable, but keep type-checkers happy
+    raise RuntimeError("transient retry loop exited unexpectedly")
+
+
+def format_failure_suffix(*, tool_name: str) -> str:
+    return (
+        f"\n\n[retry_policy] format error on `{tool_name}` (E3): "
+        f"fix JSON/arguments — this does NOT ban the strategy fingerprint. "
+        f"Retry with corrected args."
+    )
+
+
+def transient_exhausted_suffix(*, tool_name: str, attempts: int) -> str:
+    return (
+        f"\n\n[retry_policy] transient failure on `{tool_name}` after "
+        f"{attempts} attempt(s) (E3): infrastructure/lock/rate-limit style error. "
+        f"Not recorded as a strategy ban — wait briefly or change environment, "
+        f"then retry or switch approach."
+    )
 
 
 def make_failure_key(
@@ -112,6 +332,7 @@ class RetryDecision:
     should_stop: bool
     suffix: str | None
     strategy: FailedStrategy
+    kind: FailureKind = "semantic"
 
 
 @dataclass
@@ -165,7 +386,18 @@ class RetryPolicy:
         tool_name: str,
         args: dict[str, Any] | str | None,
         result: str,
-    ) -> RetryDecision:
+        kind: FailureKind | None = None,
+    ) -> RetryDecision | None:
+        """Record a **semantic/strategy** failure.
+
+        Returns None for transient/format (E3: do not burn failure_key / ban).
+        """
+        resolved = kind or classify_failure(result=result) or "semantic"
+        if resolved == "transient":
+            return None
+        if resolved == "format":
+            return None
+
         key = make_failure_key(tool_name, args, result)
         parts = key.split("|", 2)
         path = parts[1] if len(parts) > 1 else "-"
@@ -204,6 +436,7 @@ class RetryPolicy:
             should_stop=should_stop,
             suffix=self._suffix(existing, should_stop=should_stop),
             strategy=existing,
+            kind="semantic",
         )
 
     def _suffix(self, strat: FailedStrategy, *, should_stop: bool) -> str:

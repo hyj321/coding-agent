@@ -784,6 +784,11 @@ def main() -> None:
 
         check_sec_a_mod.main()
 
+        # E3: transient auto-retry vs strategy BLOCK
+        from scripts import check_e3 as check_e3_mod
+
+        check_e3_mod.main()
+
         # Windows GBK crash regression: UTF-8 bytes that are illegal as GBK
         from src.tools.shell import _decode_output
 

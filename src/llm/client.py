@@ -7,6 +7,7 @@ from typing import Any
 from openai import OpenAI
 
 from src.agent.cache_policy import CachePolicy, build_cache_policy
+from src.agent.retry_policy import call_with_transient_retry
 from src.config import Config
 
 
@@ -20,6 +21,8 @@ class LLMClient:
             workdir=str(config.workdir),
             model=config.model,
         )
+        self.transient_retries = 0
+        self.transient_recoveries = 0
 
     def chat(
         self,
@@ -37,4 +40,14 @@ class LLMClient:
         extra = self.cache_policy.openai_extra_body()
         if extra:
             kwargs["extra_body"] = extra
-        return self._client.chat.completions.create(**kwargs)
+
+        # E3: transient API errors get limited auto-retry; strategy/format do not.
+        def _once() -> Any:
+            return self._client.chat.completions.create(**kwargs)
+
+        result, report = call_with_transient_retry(_once)
+        if report.attempts > 1:
+            self.transient_retries += report.attempts - 1
+        if report.recovered:
+            self.transient_recoveries += 1
+        return result

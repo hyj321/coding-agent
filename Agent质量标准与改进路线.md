@@ -455,7 +455,7 @@ Eval 报：病理停是否 **早于** `max_steps`；误伤率（本可完成却�
 | A↔B cycle | OpenHands alternating | ❌ | **D1** |
 | 观测停滞 | stagnation / novelty | ❌ / 弱 | **D2** |
 | Goal–state 对齐 | ReflAct | ✅ Current State；规则可再钉 | Dec-A 短规则 |
-| Retry 分层 | Anatomy 四类 | ⚠️ 未严格分 transient | **D3 + E3 交叉** |
+| Retry 分层 | Anatomy 四类 | ✅ E3：transient 自动重试不进 ban；format 不 ban；semantic→BLOCK | — |
 | Plan-then-act | Claude Plan / AdaPlanner | 软（todo Skill） | **D4** 评估 |
 | 病理停早于步数顶 | Bounded loop | 部分（exact only） | D1 后补齐 |
 | 子目标树 | ReAcTree 等 | ❌ | 缓做 |
@@ -599,13 +599,14 @@ live Capability 表新增 `pathology` 列：正常任务应为 `0`。
 |----|------|----------|------------|------|
 | E1 | Web 无 Confirm 弹窗 | 会话内审批条 + 时间线 APPROVAL/DENY/EVIDENCE/FAKE_GREEN/DEDUP 气泡 | human in the loop approval UX | [x] |
 | E2 | exit 0 ≠ 语义成功 | 统一测试摘要解析；未跑到目标测不算绿 | test status parsing, false green | [x] |
-| E3 | transient vs strategy 重试未分层清 | API/锁类有限自动重试；策略失败只换策不重放 | retry taxonomy transient semantic | [ ] |
+| E3 | transient vs strategy 重试未分层清 | API/锁类有限自动重试；策略失败只换策不重放 | retry taxonomy transient semantic | [x] |
 
 ### 5.3 验收
 
 - Web ASK 下 Medium/High 可点允许/拒绝，拒绝写回 tool 错误且不执行。  
 - 只跑无关命令 exit 0 时，CompletionGate 不得放行「已修复」。  
-- **E2：** `python -m scripts.check_e2`；suite 行 `ver:irrelevant-test-block`；`echo test` / 无关 `*_test.py` 的 exit0 不算绿。
+- **E2：** `python -m scripts.check_e2`；suite 行 `ver:irrelevant-test-block`；`echo test` / 无关 `*_test.py` 的 exit0 不算绿。  
+- **E3：** `python -m scripts.check_e3`；decision 行 `e3-transient-no-ban` / `e3-strategy-block`；429/锁可自动重试且不进 ban；语义失败只 BLOCK 同 fingerprint。
 
 ---
 
@@ -1370,6 +1371,7 @@ python -m scripts.smoke_v1
 | 2026-08-30 | **Web 护栏可见 + X3 + live 复跑** | 时间线 EVIDENCE/FAKE_GREEN/DENY/APPROVAL/DEDUP 气泡；审批条 High 提示；`read_file` soft-dedup；**live** `live_post_p1_20260830.json`：locate **steps=5** ok+grep；fix-greeter **steps=5** ok+run_tests（较初基线 locate 同阶、fix 5→5 持平） |
 | 2026-08-30 | **E2 落地**（语义测绿） | 收紧 `looks_like_test_command`；`TestStatus.targets`；`test_run_covers_task` / `semantic_tests_passed`；无关 `run_tests other_test` exit0 → `irrelevant_test_run`；`check_e2` + suite `ver:irrelevant-test-block`；stop_condition 同步语义绿 |
 | 2026-08-30 | **X1 落地**（压缩抽检 eval） | `evals/context.py`：obs/state/fold/microcompact 四 fixture；`check_x1` + `run_context_eval --offline`；suite `context:*` 行；关键路径+AssertionError/FAILED 压缩后须保留 |
+| 2026-08-31 | **E3 落地**（retry 分层） | `classify_failure` transient/format/semantic；`call_with_transient_retry` 接 LLM+tool；transient/format 不进 failure_key；semantic 仍 ban+BLOCK；`check_e3` + decision `e3-*` |
 |  |  |  |
 
 ---
