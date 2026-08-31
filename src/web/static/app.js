@@ -26,6 +26,12 @@ const fileTree = document.getElementById("fileTree");
 const filesWorkdir = document.getElementById("filesWorkdir");
 const filesPane = document.getElementById("filesPane");
 const planPane = document.getElementById("planPane");
+const capsPane = document.getElementById("capsPane");
+const capsLoading = document.getElementById("capsLoading");
+const capsContent = document.getElementById("capsContent");
+const capsPolicies = document.getElementById("capsPolicies");
+const capsToolBody = document.getElementById("capsToolBody");
+const capsBoundaries = document.getElementById("capsBoundaries");
 const changedBar = document.getElementById("changedBar");
 const changedList = document.getElementById("changedList");
 const folderModal = document.getElementById("folderModal");
@@ -46,10 +52,16 @@ const approvalTool = document.getElementById("approvalTool");
 const approvalSummary = document.getElementById("approvalSummary");
 const btnApprovalAllow = document.getElementById("btnApprovalAllow");
 const btnApprovalDeny = document.getElementById("btnApprovalDeny");
+const askUserBar = document.getElementById("askUserBar");
+const askUserQuestion = document.getElementById("askUserQuestion");
+const askUserInput = document.getElementById("askUserInput");
+const btnAskUserReply = document.getElementById("btnAskUserReply");
 
 let running = false;
 let pendingApprovalId = null;
 let pendingApprovalCallId = null;
+let pendingAskUserId = null;
+let pendingAskUserCallId = null;
 let historyCache = [];
 let stepCards = new Map();
 let activeStep = null;
@@ -263,6 +275,56 @@ function hideApprovalBar() {
   if (approvalBar) approvalBar.classList.add("hidden");
   if (btnApprovalAllow) btnApprovalAllow.disabled = false;
   if (btnApprovalDeny) btnApprovalDeny.disabled = false;
+}
+
+function hideAskUserBar() {
+  pendingAskUserId = null;
+  pendingAskUserCallId = null;
+  if (askUserBar) askUserBar.classList.add("hidden");
+  if (askUserInput) askUserInput.value = "";
+  if (btnAskUserReply) btnAskUserReply.disabled = false;
+}
+
+function showAskUserRequest(data) {
+  pendingAskUserId = data.request_id;
+  pendingAskUserCallId = data.call_id || null;
+  if (askUserQuestion) askUserQuestion.textContent = data.question || "";
+  if (askUserInput) {
+    askUserInput.value = "";
+    askUserInput.disabled = false;
+  }
+  if (askUserBar) askUserBar.classList.remove("hidden");
+  if (btnAskUserReply) btnAskUserReply.disabled = false;
+  markToolAwaiting(pendingAskUserCallId, true);
+  setStatus("running", "等待你的回答…");
+  askUserBar?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  askUserInput?.focus();
+}
+
+async function respondAskUser() {
+  if (!pendingAskUserId || !running || !askUserInput) return;
+  const answer = askUserInput.value.trim();
+  if (!answer) {
+    askUserInput.focus();
+    return;
+  }
+  const requestId = pendingAskUserId;
+  if (btnAskUserReply) btnAskUserReply.disabled = true;
+  if (askUserInput) askUserInput.disabled = true;
+  try {
+    const res = await fetch("/api/ask_reply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request_id: requestId, answer }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || res.status);
+    setStatus("running", "已收到回答，继续执行…");
+  } catch (err) {
+    addInfoBubble(`回答提交失败：${err}`);
+    if (btnAskUserReply) btnAskUserReply.disabled = false;
+    if (askUserInput) askUserInput.disabled = false;
+  }
 }
 
 function markToolAwaiting(callId, awaiting) {
@@ -486,6 +548,7 @@ function resetSessionUI() {
   resetContextMeter();
   clearAttachedPaths();
   hideApprovalBar();
+  hideAskUserBar();
 }
 
 function mapStep(step) {
@@ -1337,6 +1400,30 @@ function handleEvent(data) {
       }
       if (running) setStatus("running", "运行中…");
       break;
+    case "ask_user_request":
+      showAskUserRequest(data);
+      addGuardBubble(
+        "ASK",
+        `Agent 提问：\n\n${data.question || ""}`,
+        "policy"
+      );
+      break;
+    case "ask_user_resolved":
+      markToolAwaiting(data.call_id || pendingAskUserCallId, false);
+      if (!data.request_id || data.request_id === pendingAskUserId) {
+        hideAskUserBar();
+      }
+      if (data.answered) {
+        addGuardBubble("ASK", "你已回答，Agent 将继续。", "ok");
+      } else if (data.reason === "cancelled") {
+        addGuardBubble("ASK", "提问已取消（任务停止）。", "deny");
+      } else {
+        addGuardBubble("ASK", "未收到有效回答（超时或空回复）。", "deny");
+      }
+      if (running) setStatus("running", "运行中…");
+      break;
+    case "ask_user":
+      break;
     case "auth_decision":
       {
         const key = data.step != null ? mapStep(data.step) : activeStep;
@@ -1422,6 +1509,7 @@ function handleEvent(data) {
       break;
     case "done":
       hideApprovalBar();
+      hideAskUserBar();
       if (data.cost_report) noteCostReport(data.cost_report);
       if (data.steps != null) noteCostStep(data.steps, turnCost.maxSteps);
       {
@@ -1442,6 +1530,7 @@ function handleEvent(data) {
       break;
     case "error":
       hideApprovalBar();
+      hideAskUserBar();
       addInfoBubble(data.message || "未知错误");
       setStatus("err", "错误");
       break;
@@ -1973,6 +2062,7 @@ async function startRun(taskText) {
     setStatus("err", "错误");
   } finally {
     hideApprovalBar();
+    hideAskUserBar();
     setRunControls(false);
     if (
       runStatus.textContent === "运行中…" ||
@@ -2056,6 +2146,86 @@ function switchRightTab(name) {
   });
   filesPane.classList.toggle("hidden", name !== "files");
   planPane.classList.toggle("hidden", name !== "plan");
+  capsPane.classList.toggle("hidden", name !== "caps");
+  if (name === "caps") loadCapabilities();
+}
+
+function escHtml(text) {
+  return String(text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function renderCapabilities(data) {
+  if (!capsPolicies || !capsToolBody || !capsBoundaries) return;
+  const pol = data.policies || {};
+  const web = data.web_defaults || {};
+  const shellWarn = pol.shell_mode === "allowlist";
+  const rows = [
+    ["workdir", data.workdir],
+    ["tools", String(data.tool_count || 0)],
+    ["approval (env)", pol.approval],
+    ["approval (web run)", web.approval || "ask"],
+    ["network_policy", pol.network_policy],
+    ["shell_mode", pol.shell_mode, shellWarn],
+    ["tool_visibility", pol.tool_visibility],
+    ["completion_mode", pol.completion_mode],
+    ["fake_green_mode", pol.fake_green_mode],
+    ["deny_high (env)", String(pol.deny_high)],
+  ];
+  capsPolicies.innerHTML = rows
+    .map(([k, v, warn]) => {
+      const cls = warn ? "cap-v warn" : "cap-v";
+      return `<div class="cap-row"><span class="cap-k">${escHtml(k)}</span><span class="${cls}">${escHtml(v)}</span></div>`;
+    })
+    .join("");
+  if (pol.shell_mode === "allowlist" && Array.isArray(pol.shell_allowlist_prefixes)) {
+    capsPolicies.innerHTML += `<div class="caps-allowlist">allowlist: ${escHtml(pol.shell_allowlist_prefixes.join(", "))}</div>`;
+  }
+  capsToolBody.innerHTML = (data.tools || [])
+    .map((t) => {
+      const risk = t.risk_level || "medium";
+      const hints = [];
+      if (t.destructive) hints.push("dest");
+      if (t.network) hints.push("net");
+      if (t.open_world) hints.push("open");
+      return `<tr>
+        <td>${escHtml(t.name)}</td>
+        <td>${escHtml(t.category || "")}</td>
+        <td class="risk-${escHtml(risk)}">${escHtml(risk)}</td>
+        <td>${t.is_readonly ? "Y" : "—"}</td>
+        <td>${hints.length ? escHtml(hints.join(",")) : "—"}</td>
+      </tr>`;
+    })
+    .join("");
+  capsBoundaries.innerHTML = (data.boundaries || [])
+    .map((b) => `<li>${escHtml(b)}</li>`)
+    .join("");
+  if (capsLoading) capsLoading.classList.add("hidden");
+  if (capsContent) capsContent.classList.remove("hidden");
+}
+
+async function loadCapabilities() {
+  if (!capsPane) return;
+  const wd = (workdirInput && workdirInput.value.trim()) || "demos";
+  if (capsLoading) {
+    capsLoading.classList.remove("hidden");
+    capsLoading.textContent = "Loading capabilities…";
+  }
+  if (capsContent) capsContent.classList.add("hidden");
+  try {
+    const res = await fetch(`/api/capabilities?workdir=${encodeURIComponent(wd)}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || res.status);
+    renderCapabilities(data);
+  } catch (err) {
+    if (capsLoading) {
+      capsLoading.classList.remove("hidden");
+      capsLoading.textContent = `Failed: ${err.message || err}`;
+    }
+  }
 }
 
 function closeModal(which) {
@@ -2093,6 +2263,7 @@ if (contextRing) {
 workdirInput.addEventListener("change", () => {
   workdirInput.dataset.touched = "1";
   loadFileTree();
+  if (capsPane && !capsPane.classList.contains("hidden")) loadCapabilities();
 });
 workdirInput.addEventListener("input", () => {
   workdirInput.dataset.touched = "1";
@@ -2117,6 +2288,17 @@ if (btnApprovalAllow) {
 }
 if (btnApprovalDeny) {
   btnApprovalDeny.addEventListener("click", () => respondApproval(false));
+}
+if (btnAskUserReply) {
+  btnAskUserReply.addEventListener("click", () => respondAskUser());
+}
+if (askUserInput) {
+  askUserInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      respondAskUser();
+    }
+  });
 }
 if (btnDiffRedo) {
   btnDiffRedo.addEventListener("click", () => applyDiffToDisk("modified"));

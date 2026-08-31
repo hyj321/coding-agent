@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from src.web.approval import ApprovalBridge
+from src.web.user_ask import UserAskBridge
 from src.agent.steer import SteerInbox
 from src.web.runner import (
     build_tree,
@@ -32,15 +33,17 @@ from src.web.runner import (
     write_workdir_file,
     PROJECT_ROOT,
 )
+from src.agent.capabilities import build_capability_snapshot, load_runtime_policies
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-ASSET_VERSION = "20260830steer3"
+ASSET_VERSION = "20260831c9s6"
 
 app = FastAPI(title="CodeAgent", version="0.5.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 _run_lock = threading.Lock()
 _active_bridge: ApprovalBridge | None = None
+_active_ask_bridge: UserAskBridge | None = None
 _active_cancel: threading.Event | None = None
 _active_steer: Any | None = None
 _bridge_lock = threading.Lock()
@@ -64,6 +67,11 @@ class RunRequest(BaseModel):
 class ApproveRequest(BaseModel):
     request_id: str = Field(..., min_length=4, max_length=64)
     allowed: bool
+
+
+class AskReplyRequest(BaseModel):
+    request_id: str = Field(..., min_length=4, max_length=64)
+    answer: str = Field(..., min_length=1, max_length=8000)
 
 
 class SteerRequest(BaseModel):
@@ -98,10 +106,12 @@ def health() -> dict[str, Any]:
 @app.get("/api/meta")
 def meta() -> dict[str, Any]:
     demos = PROJECT_ROOT / "demos"
+    policies = load_runtime_policies()
     return {
         "default_workdir": str(demos if demos.is_dir() else PROJECT_ROOT),
         "project_root": str(PROJECT_ROOT),
         "asset_version": ASSET_VERSION,
+        "policies": policies,
         "features": {
             "fs_write": True,
             "fs_delete": True,
@@ -109,6 +119,8 @@ def meta() -> dict[str, Any]:
             "approval": True,
             "stop": True,
             "steer": True,
+            "capability_panel": True,
+            "ask_user": True,
         },
         "suggestions": [
             {
@@ -132,6 +144,18 @@ def meta() -> dict[str, Any]:
             },
         ],
     }
+
+
+@app.get("/api/capabilities")
+def capabilities(workdir: str = Query(default="demos")) -> dict[str, Any]:
+    """T1: workdir + registered tools + runtime policies (no API key)."""
+    try:
+        wd = resolve_workdir(workdir)
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not wd.is_dir():
+        raise HTTPException(status_code=400, detail=f"workdir not found: {wd}")
+    return build_capability_snapshot(wd)
 
 
 @app.get("/api/history")
@@ -294,6 +318,19 @@ require(["vs/editor/editor.main"], function () {{
     return HTMLResponse(html)
 
 
+@app.post("/api/ask_reply")
+def ask_reply(body: AskReplyRequest) -> dict[str, Any]:
+    """Resolve a pending ask_user from the Web UI."""
+    with _bridge_lock:
+        bridge = _active_ask_bridge
+    if bridge is None:
+        raise HTTPException(status_code=409, detail="no active run awaiting ask_user")
+    result = bridge.resolve(body.request_id.strip(), body.answer)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error") or "ask_reply failed")
+    return result
+
+
 @app.post("/api/approve")
 def approve_tool(body: ApproveRequest) -> dict[str, Any]:
     """Resolve a pending High/Medium tool approval from the Web UI."""
@@ -313,11 +350,14 @@ def stop_run() -> dict[str, Any]:
     with _bridge_lock:
         cancel = _active_cancel
         bridge = _active_bridge
+        ask_bridge = _active_ask_bridge
     if cancel is None:
         raise HTTPException(status_code=409, detail="no active run to stop")
     cancel.set()
     if bridge is not None:
         bridge.close()
+    if ask_bridge is not None:
+        ask_bridge.close()
     return {"ok": True, "stopped": True}
 
 
@@ -370,12 +410,18 @@ async def run_stream(body: RunRequest) -> StreamingResponse:
         loop.call_soon_threadsafe(queue.put_nowait, event)
 
     def worker() -> None:
-        global _active_bridge, _active_cancel, _active_steer
+        global _active_bridge, _active_ask_bridge, _active_cancel, _active_steer
         cancel_event = threading.Event()
         steer_inbox = SteerInbox()
         bridge = ApprovalBridge(emit, cancel_event=cancel_event)
+        ask_bridge = UserAskBridge(emit, cancel_event=cancel_event)
+
+        def ask_user_fn(question: str, call_id: str | None = None) -> str:
+            return ask_bridge.ask(question, call_id=call_id)
+
         with _bridge_lock:
             _active_bridge = bridge
+            _active_ask_bridge = ask_bridge
             _active_cancel = cancel_event
             _active_steer = steer_inbox
         try:
@@ -411,6 +457,7 @@ async def run_stream(body: RunRequest) -> StreamingResponse:
                 deny_high=False,
                 cancel_event=cancel_event,
                 steer_inbox=steer_inbox,
+                ask_user_fn=ask_user_fn,
             )
             cost = None
             if isinstance(result.memory, dict):
@@ -435,9 +482,12 @@ async def run_stream(body: RunRequest) -> StreamingResponse:
             emit({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
         finally:
             bridge.close()
+            ask_bridge.close()
             with _bridge_lock:
                 if _active_bridge is bridge:
                     _active_bridge = None
+                if _active_ask_bridge is ask_bridge:
+                    _active_ask_bridge = None
                 if _active_cancel is cancel_event:
                     _active_cancel = None
                 if _active_steer is steer_inbox:

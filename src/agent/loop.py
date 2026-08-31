@@ -50,6 +50,11 @@ from src.agent.tool_visibility import infer_phase, visible_tool_names
 from src.llm.client import LLMClient
 from src.tools.base import ToolRegistry
 
+# C9: user clarification — never enter strategy failure_key ban
+_NO_RETRY_BAN_TOOLS = frozenset({"ask_user", "load_skill"})
+
+AskUserFn = Callable[[str, str | None], str]
+
 # Re-export for smoke tests / callers that imported from loop
 __all__ = [
     "AgentResult",
@@ -186,6 +191,7 @@ def run_agent(
     cancel_event: Any | None = None,
     steer_inbox: SteerInbox | None = None,
     max_task_tokens: int | None = None,
+    ask_user_fn: AskUserFn | None = None,
 ) -> AgentResult:
     """Core harness loop with ACON-inspired Context Manager.
 
@@ -780,6 +786,18 @@ def run_agent(
                     )
                 elif isinstance(parsed, str):
                     result = parsed
+                elif name == "ask_user" and ask_user_fn is not None and isinstance(parsed, dict):
+                    question = str(parsed.get("question") or "")
+                    result = ask_user_fn(question, call_id)
+                    log(f"[ask_user] question={question[:80]!r}")
+                    emit(
+                        {
+                            "type": "ask_user",
+                            "step": step,
+                            "id": call_id,
+                            "question": question,
+                        }
+                    )
                 elif gate is not None:
                     decision = gate.authorize(name, parsed, call_id=call_id)
                     if decision.allowed and "user approved" in decision.reason:
@@ -943,6 +961,9 @@ def run_agent(
                 if hard_blocked:
                     # Already banned; do not re-record. Stop after tool message is written.
                     step_had_failure = True
+                elif name in _NO_RETRY_BAN_TOOLS:
+                    if not ok:
+                        step_had_failure = True
                 elif not ok:
                     step_had_failure = True
                     fail_kind = classify_failure(result=str(body_for_ok)) or "semantic"

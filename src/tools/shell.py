@@ -107,5 +107,8 @@ def register_shell_tools(
             handler=run_shell,
             risk_level="medium",
             is_readonly=False,
+            destructive=True,
+            network=True,
+            open_world=True,
         )
     )

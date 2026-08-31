@@ -358,6 +358,7 @@ def register_filesystem_tools(
             handler=write_file,
             risk_level="medium",
             is_readonly=False,
+            destructive=True,
         )
     )
     registry.register(
@@ -413,6 +414,7 @@ def register_filesystem_tools(
             handler=edit_file,
             risk_level="medium",
             is_readonly=False,
+            destructive=True,
         )
     )
     registry.register(

@@ -24,6 +24,22 @@ class Tool(Protocol):
 Handler = Callable[[dict[str, Any]], str]
 
 
+def validate_tool_metadata(tool: FunctionTool) -> None:
+    """S6: reject internally inconsistent tool annotations at registration."""
+    if tool.is_readonly and tool.destructive:
+        raise ValueError(
+            f"Tool {tool.name!r}: is_readonly and destructive cannot both be true"
+        )
+    if tool.is_readonly and tool.open_world:
+        raise ValueError(
+            f"Tool {tool.name!r}: is_readonly and open_world cannot both be true"
+        )
+    if tool.name == "run_shell" and not (tool.destructive and tool.network and tool.open_world):
+        raise ValueError(
+            "Tool 'run_shell' must set destructive=True, network=True, open_world=True"
+        )
+
+
 @dataclass
 class FunctionTool:
     """Concrete tool: OpenAI-style schema + local handler + risk metadata."""
@@ -34,6 +50,13 @@ class FunctionTool:
     handler: Handler
     risk_level: RiskLevel = "medium"
     is_readonly: bool = False
+    # S6 / MCP-style hints — enforced by PermissionGate where applicable
+    destructive: bool = False
+    network: bool = False
+    open_world: bool = False
+
+    def __post_init__(self) -> None:
+        validate_tool_metadata(self)
 
     def run(self, arguments: dict[str, Any]) -> str:
         try:
@@ -49,6 +72,7 @@ class ToolRegistry:
     def register(self, tool: FunctionTool) -> None:
         if tool.name in self._tools:
             raise ValueError(f"Tool already registered: {tool.name}")
+        validate_tool_metadata(tool)
         self._tools[tool.name] = tool
 
     def get(self, name: str) -> FunctionTool | None:

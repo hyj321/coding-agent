@@ -37,6 +37,7 @@ _READONLY = frozenset(
         "rag_search",
         "git_status",
         "git_diff",
+        "ask_user",
     }
 )
 _PHASE_ALLOW: dict[str, frozenset[str] | None] = {

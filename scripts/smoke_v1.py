@@ -30,6 +30,7 @@ def main() -> None:
         reg = build_default_registry(gate, max_output_chars=2000)
 
         expected = {
+            "ask_user",
             "edit_file",
             "git_diff",
             "git_status",
@@ -46,6 +47,22 @@ def main() -> None:
             "write_file",
         }
         assert set(reg.names()) == expected, reg.names()
+
+        # S6: tool annotation metadata
+        shell_tool = reg.get("run_shell")
+        assert shell_tool is not None
+        assert shell_tool.destructive and shell_tool.network and shell_tool.open_world
+        assert reg.get("write_file").destructive
+        assert reg.get("read_file").is_readonly and not reg.get("read_file").destructive
+
+        # C9: ask_user via registry handler
+        reg_ask = build_default_registry(
+            gate,
+            max_output_chars=2000,
+            ask_user_fn=lambda q: f"User answer:\n{q}",
+        )
+        ask_out = reg_ask.dispatch("ask_user", {"question": "Which module?"})
+        assert ask_out == "User answer:\nWhich module?", ask_out
 
         skill_body = reg.dispatch("load_skill", {"name": "debugging"})
         assert skill_body.startswith("# Skill: debugging"), skill_body[:80]

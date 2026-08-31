@@ -203,6 +203,7 @@ def run_coding_task(
     deny_high: bool | None = None,
     cancel_event: Any | None = None,
     steer_inbox: Any | None = None,
+    ask_user_fn: Any | None = None,
 ) -> tuple[AgentResult, Config, Path | None]:
     config = Config.from_env(
         workdir=workdir,
@@ -234,12 +235,15 @@ def run_coding_task(
         deny_high=high_deny,
         ask_min_risk=min_risk,  # type: ignore[arg-type]
         network_policy=str(getattr(config, "network_policy", "high") or "high"),
+        shell_mode=str(getattr(config, "shell_mode", "open") or "open"),
+        shell_allowlist_prefixes=getattr(config, "shell_allowlist_prefixes", None),
     )
 
     registry = build_default_registry(
         gate,
         max_output_chars=config.max_tool_output_chars,
         transcript_dir=config.transcript_dir,
+        ask_user_fn=ask_user_fn,
     )
     system_prompt = build_system_prompt(config.workdir, registry.names())
     client = LLMClient(config)
@@ -304,6 +308,7 @@ def run_coding_task(
         cancel_event=cancel_event,
         steer_inbox=steer_inbox,
         max_task_tokens=getattr(config, "max_task_tokens", 0) or 0,
+        ask_user_fn=ask_user_fn,
     )
 
     transcript_path: Path | None = None

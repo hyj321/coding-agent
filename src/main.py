@@ -101,16 +101,30 @@ def main(argv: list[str] | None = None) -> int:
         print("No task provided.", file=sys.stderr)
         return 2
 
+    def cli_ask_user(question: str, call_id: str | None = None) -> str:
+        _ = call_id
+        print(f"\n[Agent asks]\n{question}\n")
+        try:
+            answer = input("Your answer> ").strip()
+        except EOFError:
+            return "Error: user did not answer (no stdin)"
+        if not answer:
+            return "Error: user replied with empty text"
+        return f"User answer:\n{answer}"
+
     gate = PermissionGate(
         config.workdir,
         approval=config.approval,
         deny_high=bool(getattr(config, "deny_high", False)),
         network_policy=str(getattr(config, "network_policy", "high") or "high"),
+        shell_mode=str(getattr(config, "shell_mode", "open") or "open"),
+        shell_allowlist_prefixes=getattr(config, "shell_allowlist_prefixes", None),
     )
     registry = build_default_registry(
         gate,
         max_output_chars=config.max_tool_output_chars,
         transcript_dir=config.transcript_dir,
+        ask_user_fn=cli_ask_user,
     )
     system_prompt = build_system_prompt(config.workdir, registry.names())
     client = LLMClient(config)
@@ -119,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[config] base_url={config.base_url} model={config.model}")
     print(
         f"[config] approval={config.approval.value} "
+        f"network={config.network_policy} shell_mode={config.shell_mode} "
         f"max_messages={config.max_messages} "
         f"context_budget≈{config.context_token_budget} "
         f"max_task_tokens={config.max_task_tokens or 'off'}"
@@ -135,6 +150,7 @@ def main(argv: list[str] | None = None) -> int:
         context_token_budget=config.context_token_budget,
         transcript_dir=config.transcript_dir,
         max_task_tokens=config.max_task_tokens,
+        ask_user_fn=cli_ask_user,
     )
 
     if config.transcript_dir is not None:

@@ -9,6 +9,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from src.agent.permissions import ApprovalMode, parse_approval_mode
+from src.agent.shell_allowlist import ShellMode, load_shell_allowlist_from_env, parse_shell_mode
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,9 @@ class Config:
     # Sec-A: high | deny | allow — pip/npm/curl risk policy
     network_policy: str = "high"
     deny_high: bool = False
+    # S5: open | allowlist — shell command prefix gate
+    shell_mode: ShellMode = "open"
+    shell_allowlist_prefixes: tuple[str, ...] = ()
 
     @classmethod
     def from_env(
@@ -192,6 +196,9 @@ class Config:
         deny_high_env = (os.getenv("DENY_HIGH") or "").strip().lower()
         deny_high = deny_high_env in {"1", "true", "yes", "on"}
 
+        shell_mode = parse_shell_mode(os.getenv("SHELL_MODE"))
+        shell_allowlist = load_shell_allowlist_from_env()
+
         return cls(
             api_key=api_key,
             base_url=base_url,
@@ -216,4 +223,6 @@ class Config:
             fake_green_mode=fake_green,
             network_policy=network_policy,
             deny_high=deny_high,
+            shell_mode=shell_mode,
+            shell_allowlist_prefixes=shell_allowlist,
         )

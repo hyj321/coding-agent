@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=20260830steer3" />
+  <link rel="stylesheet" href="/static/styles.css?v=20260831c9s6" />
   <script src="https://cdn.jsdelivr.net/npm/marked@15.0.7/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js"></script>
@@ -115,6 +115,16 @@
                 <button type="button" id="btnApprovalAllow" class="btn-primary">允许</button>
               </div>
             </div>
+            <div id="askUserBar" class="ask-user-bar hidden" role="dialog" aria-live="assertive">
+              <div class="ask-user-main">
+                <div class="ask-user-title">Agent 需要你回答</div>
+                <pre class="ask-user-question" id="askUserQuestion"></pre>
+                <textarea id="askUserInput" class="ask-user-input" rows="2" placeholder="输入你的回答…"></textarea>
+              </div>
+              <div class="ask-user-actions">
+                <button type="button" id="btnAskUserReply" class="btn-primary">发送回答</button>
+              </div>
+            </div>
             <div class="workdir-row">
               <label>
                 Workdir
@@ -161,6 +171,7 @@
           <div class="right-panel-tabs">
             <button type="button" class="rp-tab active" data-tab="files">Files</button>
             <button type="button" class="rp-tab" data-tab="plan">Plan</button>
+            <button type="button" class="rp-tab" data-tab="caps" title="Tools &amp; permissions">Caps</button>
             <button type="button" id="btnToggleRight" class="rp-collapse" title="Collapse">⟨</button>
           </div>
           <div id="filesPane" class="rp-pane">
@@ -170,6 +181,27 @@
           <div id="planPane" class="rp-pane hidden">
             <div id="todoList" class="todo-list"></div>
             <div id="todoEmpty" class="todo-empty">No plan yet — agent will use todo_write.</div>
+          </div>
+          <div id="capsPane" class="rp-pane hidden">
+            <div id="capsLoading" class="caps-loading">Loading capabilities…</div>
+            <div id="capsContent" class="caps-content hidden">
+              <div id="capsPolicies" class="caps-policies"></div>
+              <div class="caps-table-wrap">
+                <table class="caps-table" aria-label="Registered tools">
+                  <thead>
+                    <tr>
+                      <th>Tool</th>
+                      <th>Cat</th>
+                      <th>Risk</th>
+                      <th>RO</th>
+                      <th>Hints</th>
+                    </tr>
+                  </thead>
+                  <tbody id="capsToolBody"></tbody>
+                </table>
+              </div>
+              <ul id="capsBoundaries" class="caps-boundaries"></ul>
+            </div>
           </div>
         </aside>
       </div>
@@ -228,6 +260,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=20260830steer3"></script>
+  <script src="/static/app.js?v=20260831c9s6"></script>
 </body>
 </html>

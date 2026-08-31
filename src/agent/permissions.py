@@ -16,7 +16,15 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Sequence
+
+from src.agent.shell_allowlist import (
+    DEFAULT_SHELL_ALLOWLIST_PREFIXES,
+    ShellMode,
+    parse_shell_mode,
+    shell_allowlist_deny_reason,
+    shell_matches_allowlist,
+)
 
 RiskLevel = Literal["low", "medium", "high"]
 NetworkPolicy = Literal["high", "deny", "allow"]
@@ -238,10 +246,51 @@ def looks_like_network_or_install(command: str) -> bool:
     return any(p.search(command or "") for p in _NETWORK_INSTALL_PATTERNS)
 
 
+def looks_like_destructive_shell(command: str) -> bool:
+    """Heuristic destructive shell (S6 annotation cross-check)."""
+    cmd = command or ""
+    if any(p.search(cmd) for p in _HIGH_SHELL_PATTERNS):
+        return True
+    if re.search(r"\brm\b", cmd, re.I):
+        return True
+    if re.search(r"\bdel\s+/[fqs]", cmd, re.I):
+        return True
+    if re.search(r"\bRemove-Item\b.*-Recurse", cmd, re.I):
+        return True
+    return False
+
+
+def validate_shell_annotation_mismatch(
+    tool: Any,
+    command: str,
+) -> str | None:
+    """Return hard-deny reason when run_shell command class ≠ tool hints (S6)."""
+    if tool is None or getattr(tool, "name", None) != "run_shell":
+        return None
+    destructive = bool(getattr(tool, "destructive", False))
+    network = bool(getattr(tool, "network", False))
+    open_world = bool(getattr(tool, "open_world", False))
+    if not open_world:
+        return (
+            "已拒绝工具元数据不符 denied: run_shell requires open_world=true annotation"
+        )
+    if looks_like_network_or_install(command) and not network:
+        return (
+            "已拒绝工具元数据不符 denied: network/install shell requires tool.network=true"
+        )
+    if looks_like_destructive_shell(command) and not destructive:
+        return (
+            "已拒绝工具元数据不符 denied: destructive shell requires tool.destructive=true"
+        )
+    return None
+
+
 def assess_shell_risk(
     command: str,
     *,
     network_policy: NetworkPolicy = "high",
+    shell_mode: ShellMode = "open",
+    allowlist_prefixes: Sequence[str] | None = None,
 ) -> tuple[RiskLevel, str | None]:
     """Return (risk, hard_deny_reason). hard_deny_reason set ⇒ must Deny."""
     for pat in _HARD_DENY_PATTERNS:
@@ -251,6 +300,15 @@ def assess_shell_risk(
     sub_deny = _subprocess_sensitive_deny(command)
     if sub_deny:
         return "high", sub_deny
+
+    if parse_shell_mode(shell_mode) == "allowlist":
+        prefixes = (
+            tuple(allowlist_prefixes)
+            if allowlist_prefixes is not None
+            else DEFAULT_SHELL_ALLOWLIST_PREFIXES
+        )
+        if not shell_matches_allowlist(command, prefixes):
+            return "high", shell_allowlist_deny_reason(command, prefixes)
 
     policy = parse_network_policy(network_policy)
     if looks_like_network_or_install(command):
@@ -281,6 +339,8 @@ class PermissionGate:
         deny_high: bool = False,
         ask_min_risk: RiskLevel = "medium",
         network_policy: NetworkPolicy | str = "high",
+        shell_mode: ShellMode | str = "open",
+        shell_allowlist_prefixes: Sequence[str] | None = None,
     ) -> None:
         self.workdir = workdir.resolve()
         self.approval = approval
@@ -291,6 +351,14 @@ class PermissionGate:
         )
         self.network_policy: NetworkPolicy = parse_network_policy(
             network_policy if isinstance(network_policy, str) else str(network_policy)
+        )
+        self.shell_mode: ShellMode = parse_shell_mode(
+            shell_mode if isinstance(shell_mode, str) else str(shell_mode)
+        )
+        self.shell_allowlist_prefixes: tuple[str, ...] = (
+            tuple(shell_allowlist_prefixes)
+            if shell_allowlist_prefixes is not None
+            else DEFAULT_SHELL_ALLOWLIST_PREFIXES
         )
         self._registry: Any | None = None
 
@@ -339,8 +407,15 @@ class PermissionGate:
 
         if tool_name == "run_shell":
             command = str(arguments.get("command") or "")
+            tool = self._registry.get(tool_name) if self._registry else None
+            ann_deny = validate_shell_annotation_mismatch(tool, command)
+            if ann_deny:
+                return "high", ann_deny
             shell_risk, shell_deny = assess_shell_risk(
-                command, network_policy=self.network_policy
+                command,
+                network_policy=self.network_policy,
+                shell_mode=self.shell_mode,
+                allowlist_prefixes=self.shell_allowlist_prefixes,
             )
             if shell_deny:
                 return "high", shell_deny

@@ -14,6 +14,7 @@ from src.agent.permissions import (
     PermissionGate,
     assess_shell_risk,
     looks_like_network_or_install,
+    validate_shell_annotation_mismatch,
 )
 
 
@@ -96,6 +97,71 @@ def main() -> None:
     reset = gate_high.authorize("run_shell", {"command": "git reset --hard"})
     assert reset.risk_level == "high"
     print("ok regression")
+
+    print("=== S5: shell allowlist mode ===")
+    gate_list = PermissionGate(
+        root,
+        approval=ApprovalMode.AUTO,
+        network_policy="allow",
+        shell_mode="allowlist",
+    )
+    pytest_list = gate_list.authorize("run_shell", {"command": "pytest -q greeter_test.py"})
+    assert pytest_list.allowed, pytest_list.reason
+
+    py_script = gate_list.authorize(
+        "run_shell",
+        {"command": "python greeter_test.py"},
+    )
+    assert py_script.allowed, py_script.reason
+
+    pip_list = gate_list.authorize("run_shell", {"command": "pip install requests"})
+    assert not pip_list.allowed and "allowlist" in pip_list.reason.lower(), pip_list.reason
+
+    curl_list = gate_list.authorize("run_shell", {"command": "curl https://example.com"})
+    assert not curl_list.allowed and "allowlist" in curl_list.reason.lower(), curl_list.reason
+
+    rm_list = gate_list.authorize("run_shell", {"command": "rm -rf node_modules"})
+    assert not rm_list.allowed and "allowlist" in rm_list.reason.lower(), rm_list.reason
+
+    risk_al, deny_al = assess_shell_risk(
+        "pip install x",
+        network_policy="allow",
+        shell_mode="allowlist",
+    )
+    assert deny_al and "allowlist" in deny_al.lower(), deny_al
+
+    risk_py, deny_py = assess_shell_risk(
+        "pytest -q",
+        network_policy="allow",
+        shell_mode="allowlist",
+    )
+    assert deny_py is None and risk_py == "medium", (risk_py, deny_py)
+    print("ok shell allowlist")
+
+    print("=== S6: tool annotation gate ===")
+    from src.tools import build_default_registry
+
+    gate_ann = PermissionGate(root, approval=ApprovalMode.AUTO)
+    reg_ann = build_default_registry(gate_ann)
+    shell_tool = reg_ann.get("run_shell")
+    assert shell_tool is not None
+    assert shell_tool.destructive and shell_tool.network and shell_tool.open_world
+    curl_gate = gate_ann.authorize("run_shell", {"command": "curl https://example.com"})
+    assert curl_gate.allowed or curl_gate.risk_level == "high"
+
+    mismatch = validate_shell_annotation_mismatch(
+        type("T", (), {"name": "run_shell", "destructive": True, "network": False, "open_world": True})(),
+        "curl https://evil.example",
+    )
+    assert mismatch and "network" in mismatch.lower(), mismatch
+    print("ok tool annotations")
+
+    print("=== T8: security red-team ===")
+    from evals.security_redteam import redteam_all_ok, run_redteam
+
+    rt = run_redteam(root)
+    assert redteam_all_ok(root), [r for r in rt if not r["ok"]]
+    print(f"ok red-team ({len(rt)} cases)")
 
     print("OK")
 
