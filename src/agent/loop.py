@@ -25,6 +25,7 @@ from src.agent.memory import (
     save_turn_summary_file,
     save_working_memory,
 )
+from src.agent.episodes import append_episode, build_episode, episodes_enabled
 from src.agent.permissions import PermissionGate
 from src.agent.retry_policy import (
     RetryPolicy,
@@ -323,6 +324,14 @@ def run_agent(
         # "already nudged / force-stop / tests green" latch from a previous turn.
         clear_nudge_state(ctx.task_state)
         ctx.post_nudge_mutating = 0
+        # X2 episodes + optional RAG prefetch into Current State
+        ctx.hydrate_recall(user_task, transcript_dir=tdir if isinstance(tdir, Path) else None)
+        if ctx.state.episode_recall:
+            log("[memory] hydrated recent episodes into Current State")
+            emit({"type": "episode_recall", "text": ctx.state.episode_recall[:800]})
+        if ctx.state.rag_prefetch:
+            log("[memory] RAG prefetch injected into Current State")
+            emit({"type": "rag_prefetch", "text": ctx.state.rag_prefetch[:800]})
     tools = registry.openai_tools()  # may be narrowed each step when visibility=auto
     cfg = client.config
 
@@ -463,6 +472,24 @@ def run_agent(
             if mem_path is not None:
                 log(f"[memory] appended → {mem_path}")
                 emit({"type": "memory_write", "path": str(mem_path)})
+            if episodes_enabled() and result.stopped_reason != "interrupted":
+                ep = build_episode(
+                    task=user_task,
+                    final_text=result.final_text,
+                    stopped_reason=result.stopped_reason,
+                    memory=result.memory if isinstance(result.memory, dict) else None,
+                )
+                ep_path = append_episode(workdir, ep)
+                if ep_path is not None:
+                    log(f"[memory] episode → {ep_path}")
+                    emit(
+                        {
+                            "type": "episode_write",
+                            "path": str(ep_path),
+                            "stopped_reason": result.stopped_reason,
+                            "mutated_paths": list(ep.get("mutated_paths") or [])[:8],
+                        }
+                    )
             summary_path = save_turn_summary_file(workdir, summary)
             emit(
                 {

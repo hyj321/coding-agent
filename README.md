@@ -30,6 +30,7 @@
 - 上下文裁剪（`MAX_MESSAGES`）+ 工具输出截断
 - **ACON 简化版 Context Manager**：分层上下文 + pytest 等观测压缩 + 超预算历史摘要折叠（`CONTEXT_TOKEN_BUDGET`）
 - **长短期记忆（P0–P2）**：MEMORY.md、working_memory、续写瘦身、前缀/后缀布局、折叠重注、MicroCompact、失败对更新压缩 guideline、本地 TF–IDF `rag_search`、prompt-cache 钩子
+- **X2 Episode + RAG Prefetch**：每轮写入 `.agent/episodes.jsonl`（task / 变更文件 / 测试 / failed_keys）；下轮按 goal 召回注入 Current State；开场自动 TF–IDF 预取（`EPISODE_MEMORY` / `RAG_PREFETCH`，默认开）
 - 运行 transcript → `transcripts/*.json`（含 `memory` 快照）
 - 可选 Web UI（`python -m src.web`）
 

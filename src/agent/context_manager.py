@@ -109,6 +109,9 @@ class ContextState:
     # X3: path|offset|limit → {mtime, summary, chars} for soft-dedup reads
     read_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
     soft_dedup_events: int = 0
+    # X2 + RAG prefetch (injected at run start; not mutated mid-run)
+    episode_recall: str = ""
+    rag_prefetch: str = ""
 
     def note_path(self, path: str | None) -> None:
         if not path:
@@ -155,12 +158,18 @@ class ContextState:
             mem = format_memory_section(self.project_memory)
             if mem:
                 lines.append(mem)
+        if self.episode_recall:
+            lines.append(self.episode_recall.strip())
+        if self.rag_prefetch:
+            lines.append(self.rag_prefetch.strip())
         has_body = bool(
             self.focus_files
             or self.related_files
             or self.last_errors
             or self.todos_text
             or self.project_memory
+            or self.episode_recall
+            or self.rag_prefetch
         )
         if not has_body and not self.budget_line:
             lines.append("(no mutable state yet)")
@@ -212,6 +221,24 @@ class ContextManager:
     def reload_project_memory(self, *, max_chars: int = 3000) -> None:
         """Load / refresh MEMORY.md excerpt into Current State (cross-run long memory)."""
         self.state.project_memory = load_memory_excerpt(self.workdir, max_chars=max_chars)
+
+    def hydrate_recall(
+        self,
+        user_task: str,
+        *,
+        transcript_dir: Path | None = None,
+    ) -> None:
+        """X2 episodes + optional RAG prefetch into Current State (once per turn)."""
+        from src.agent.episodes import recall_episodes_for_prompt
+        from src.agent.rag import prefetch_rag_for_task
+
+        goal = (user_task or "").strip() or self.task_state.goal or self.state.task
+        self.state.episode_recall = recall_episodes_for_prompt(self.workdir, goal)
+        self.state.rag_prefetch = prefetch_rag_for_task(
+            self.workdir,
+            goal,
+            transcript_dir=transcript_dir,
+        )
 
     def import_memory(self, snapshot: dict[str, Any] | None) -> None:
         """Hydrate working memory from a prior session / working_memory.json export."""
@@ -304,6 +331,8 @@ You solve programming tasks by calling tools.
 11. Project Memory (MEMORY.md) may appear under Current State — treat it as
     durable cross-run notes (conventions / past pitfalls); do not ignore it.
 12. Use memory_search for keyword recall; rag_search for local TF–IDF semantic recall.
+    Current State may already include Recent Episodes + RAG Prefetch — reuse those
+    before re-searching. Prefer grep for code locate; RAG is cross-file/semantic hint.
 13. Prompt layout: system+task are a stable prefix; working memory is a variable suffix.
 14. If an Available Skill matches the task, call load_skill(name) early (same turn
     as first reads when possible), then follow it.

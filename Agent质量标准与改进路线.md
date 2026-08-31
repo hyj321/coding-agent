@@ -570,7 +570,7 @@ live Capability 表新增 `pathology` 列：正常任务应为 `0`。
 | ID | 缺口 | 建议动作 | 调研关键词 | 状态 |
 |----|------|----------|------------|------|
 | X1 | 压缩是否丢关键信息不可测 | 抽检：压缩前后关键路径/断言是否仍在 | context compaction eval, ACON | [x] |
-| X2 | 跨 run 语义记忆弱 | 结构化 episode / 失败策略库；先规则后向量 | agent memory episodes, working memory | [ ] |
+| X2 | 跨 run 语义记忆弱 | 结构化 episode / 失败策略库；先规则后向量 | agent memory episodes, working memory | [x] 2026-08-31：`.agent/episodes.jsonl` + Current State 注入；`RAG_PREFETCH` 开场 TF–IDF |
 | X3 | 同文件未变仍重读全文 | soft-dedup：mtime 未变则回摘要 | soft dedup tool result, Kimi tool-dedup | [x] |
 
 ### 4.3 与计划书
@@ -1646,6 +1646,7 @@ python -m scripts.smoke_v1
 | 2026-08-31 | **S6+C9+T8 Cap×Sec-B 落地** | 工具注解 destructive/network/open_world + Gate 校验；`ask_user` Web/CLI；`evals/security_redteam.py` + suite `sec:redteam-*` |
 | 2026-08-31 | **T1+S5 Cap×Sec-A 落地** | Web 右栏 **Caps** 面板 + `/api/capabilities` + `scripts/show_capabilities`；`SHELL_MODE=allowlist` + 前缀 Gate；`check_sec_a` / suite `sec:allowlist-*` |
 | 2026-08-31 | **十维严格自查 + §14 升级规划写入** | 答辩级达标、严格 Agent 差一层；主缺口：默认 preset 偏松、Search-first 无 runtime enforce、Completion nudge 逃逸、live 待复跑；下一优先 Tier 0～1 |
+| 2026-08-31 | **X2 Episode + RAG Prefetch 落地** | `.agent/episodes.jsonl` 每轮落盘；开场按 goal 召回注入 Current State；`RAG_PREFETCH` 自动 TF–IDF top-k（可关）；smoke 覆盖 |
 |  |  |  |
 
 ---
@@ -1728,7 +1729,7 @@ python -m scripts.run_capability_eval --live   # locate steps ≤ 基线+1
 | **2-3** | Edit 后 lint 摘要 | C11 | 4 工具 · 5 执行 | `LINT_ON_EDIT=1` → `ruff check` concise 摘要（非 LSP） | 1d | [ ] |
 | **2-4** | 结构化 git_commit | C10 | 4 工具 · 9 安全 | 仅 workdir、禁 push/force、Medium+ 审批 | 1.5d | [ ] |
 | **2-5** | StopCondition 推断 | V3 | 1 任务 · 10 终止 | 首轮从 goal 推断 `stop_condition`（文档任务 vs pytest 任务） | 1d | [ ] |
-| **2-6** | 结构化 Episode 记忆 | X2 | 3 上下文 | `.agent/episodes.jsonl`；continue 注入摘要 | 2d | [ ] |
+| **2-6** | 结构化 Episode 记忆 | X2 | 3 上下文 | `.agent/episodes.jsonl`；continue 注入摘要；**附带** `RAG_PREFETCH` 开场 TF–IDF | 2d | [x] 2026-08-31 |
 
 ### 14.5 Tier 3 — 低优先级 / 答辩「未来工作」（1～2 周+）
 

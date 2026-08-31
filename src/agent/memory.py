@@ -189,8 +189,8 @@ def format_turn_summary(
                 f"{cr.get('tool_calls_total', 0)} tool calls"
             )
     lines.append(
-        "- **续写提示：** 后续任务可依赖 MEMORY.md / working_memory；"
-        "细节以磁盘文件为准，必要时 read_file。"
+        "- **续写提示：** 后续任务可依赖 MEMORY.md / working_memory / "
+        "`.agent/episodes.jsonl`；细节以磁盘文件为准，必要时 read_file。"
     )
     return "\n".join(lines).strip() + "\n"
 

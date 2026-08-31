@@ -240,6 +240,13 @@ def load_rag_index(workdir: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def rag_prefetch_enabled() -> bool:
+    import os
+
+    raw = (os.getenv("RAG_PREFETCH") or "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
 def rag_search(
     workdir: Path,
     query: str,
@@ -289,3 +296,62 @@ def rag_search(
             f"- [{score:.3f}] ({d.get('kind')}) {d.get('source')}: {snippet}"
         )
     return "\n".join(lines)
+
+
+def prefetch_rag_for_task(
+    workdir: Path,
+    task: str,
+    *,
+    transcript_dir: Path | None = None,
+    top_k: int = 3,
+    max_chars: int | None = None,
+) -> str:
+    """One-shot auto RAG at run start for Current State (no tool call needed).
+
+    Returns empty string when disabled, query empty, or no useful hits.
+    """
+    if not rag_prefetch_enabled():
+        return ""
+    q = (task or "").strip()
+    if not q:
+        return ""
+    import os
+
+    if max_chars is None:
+        try:
+            max_chars = int(os.getenv("RAG_PREFETCH_MAX_CHARS", "600") or "600")
+        except ValueError:
+            max_chars = 600
+    max_chars = max(120, min(int(max_chars), 2000))
+    top_k = max(1, min(int(top_k), 5))
+
+    # Prefer existing index; avoid expensive rebuild on cold empty workdirs
+    index = load_rag_index(workdir)
+    if index is None or not index.get("docs"):
+        # Build once — small demos are cheap; failures return empty
+        try:
+            index = build_rag_index(workdir, transcript_dir=transcript_dir)
+        except OSError:
+            return ""
+    if not index.get("docs"):
+        return ""
+
+    raw = rag_search(
+        workdir,
+        q,
+        transcript_dir=transcript_dir,
+        top_k=top_k,
+        rebuild=False,
+    )
+    if raw.startswith("Error") or raw.startswith("No RAG") or raw.startswith("No lexical"):
+        return ""
+
+    # Re-title for Current State (shorter header)
+    lines = raw.splitlines()
+    body = "\n".join(lines[1:] if lines else [])
+    if not body.strip():
+        return ""
+    text = "## RAG Prefetch (local TF–IDF)\n" + body.strip()
+    if len(text) > max_chars:
+        text = text[: max_chars - 1] + "…"
+    return text

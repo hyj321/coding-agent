@@ -1188,8 +1188,9 @@ def main() -> None:
         assert sess_u["turns"][-1]["context_usage"]["remaining_pct"] == 55
 
         schemas = reg.openai_tools()
-        assert len(schemas) == len(reg.names()) == 14
+        assert len(schemas) == len(reg.names()) == 15
         assert any(s["function"]["name"] == "load_skill" for s in schemas)
+        assert any(s["function"]["name"] == "ask_user" for s in schemas)
 
         todo_out = reg.dispatch(
             "todo_write",
@@ -1605,7 +1606,71 @@ def main() -> None:
             isinstance(m.get("content"), str) and "ACTIVE GOAL" in m["content"] for m in slim
         )
 
-    print("smoke_v1: OK (ui-events+context+memory-p0+p1+p2)")
+        # X2 episodes + RAG prefetch (offline, no API)
+        from src.agent.context_manager import ContextManager
+        from src.agent.episodes import (
+            append_episode,
+            build_episode,
+            format_episodes_section,
+            load_episodes,
+            recall_episodes_for_prompt,
+            select_episodes_for_goal,
+        )
+        from src.agent.rag import prefetch_rag_for_task
+
+        ep1 = build_episode(
+            task="修复 greeter.py 使测试通过",
+            final_text="已改 greet，测试通过",
+            stopped_reason="completed",
+            memory={
+                "focus_files": ["greeter.py", "greeter_test.py"],
+                "task_state": {
+                    "mutated_paths": ["greeter.py"],
+                    "test_status": {"passed": True, "summary": "1 passed"},
+                    "failed": [],
+                },
+            },
+        )
+        assert ep1["source_mutated"] == ["greeter.py"]
+        assert ep1["test_passed"] is True
+        assert append_episode(root, ep1) is not None
+        ep2 = build_episode(
+            task="重构 timer 模块",
+            final_text="未完成",
+            stopped_reason="max_steps",
+            memory={"focus_files": ["timer.py"], "task_state": {"mutated_paths": []}},
+        )
+        append_episode(root, ep2)
+        loaded = load_episodes(root)
+        assert len(loaded) >= 2
+        picked = select_episodes_for_goal(loaded, "继续修 greeter 测试", max_n=2)
+        assert picked and "greeter" in str(picked[0].get("task") or "").lower()
+        section = format_episodes_section(picked)
+        assert "Recent Episodes" in section and "greeter" in section.lower()
+        recalled = recall_episodes_for_prompt(root, "greeter 修复")
+        assert "Recent Episodes" in recalled
+
+        (root / "greeter.py").write_text("def greet(n):\n    return f'hi {n}'\n", encoding="utf-8")
+        (root / "MEMORY.md").write_text(
+            "# Project Memory\n\n## note\ngreeter greet returns hi\n",
+            encoding="utf-8",
+        )
+        pre = prefetch_rag_for_task(root, "greeter greet function", top_k=2, max_chars=500)
+        assert "RAG Prefetch" in pre or pre == ""  # empty ok if no lexical overlap
+        # Force index then prefetch should usually hit greeter
+        from src.agent.rag import build_rag_index
+
+        build_rag_index(root)
+        pre2 = prefetch_rag_for_task(root, "greeter greet", top_k=3, max_chars=500)
+        assert "RAG Prefetch" in pre2, pre2[:200]
+
+        cm = ContextManager(workdir=root, tool_names=reg.names(), token_budget=8000)
+        cm.hydrate_recall("修复 greeter")
+        rendered = cm.state.render_current_state()
+        assert "Recent Episodes" in rendered
+        assert "RAG Prefetch" in rendered or cm.state.rag_prefetch == ""
+
+    print("smoke_v1: OK (ui-events+context+memory-p0+p1+p2+x2-rag)")
 
 
 if __name__ == "__main__":
