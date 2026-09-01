@@ -7,7 +7,6 @@ const sendBtn = document.getElementById("sendBtn");
 const stopBtn = document.getElementById("stopBtn");
 const workdirInput = document.getElementById("workdirInput");
 const maxStepsInput = document.getElementById("maxStepsInput");
-const suggestionCards = document.getElementById("suggestionCards");
 const recentList = document.getElementById("recentList");
 const historySearch = document.getElementById("historySearch");
 const todoList = document.getElementById("todoList");
@@ -101,8 +100,6 @@ let monacoDiff = null;
 let monacoMode = null; // "code" | "diff"
 /** Active diff for Undo/Redo: { path, old_content, new_content, is_new, applied: "modified"|"original" } */
 let activeDiff = null;
-
-const ICONS = ["🌐", "📈", "📄"];
 
 function newSessionId() {
   if (crypto.randomUUID) return crypto.randomUUID().replace(/-/g, "").slice(0, 24);
@@ -1286,25 +1283,6 @@ async function applyDiffToDisk(which) {
   }
 }
 
-function renderSuggestions(items) {
-  suggestionCards.innerHTML = "";
-  items.forEach((item, i) => {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "card";
-    btn.innerHTML = `
-      <div class="card-banner">${ICONS[i % ICONS.length]}</div>
-      <div class="card-body">
-        <div class="card-title">${escapeHtml(item.title)}</div>
-        <p class="card-desc">${escapeHtml(item.desc)}</p>
-      </div>`;
-    btn.addEventListener("click", () => {
-      startRun(item.prompt);
-    });
-    suggestionCards.appendChild(btn);
-  });
-}
-
 function renderHistory(items) {
   const q = (historySearch.value || "").trim().toLowerCase();
   const filtered = !q
@@ -1696,7 +1674,6 @@ async function loadMeta() {
   if (data.default_workdir && !workdirInput.dataset.touched) {
     workdirInput.value = data.default_workdir;
   }
-  renderSuggestions(data.suggestions || []);
   loadFileTree();
   // If server still holds a run lock (e.g. after refresh), show Stop
   try {

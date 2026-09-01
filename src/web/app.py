@@ -43,7 +43,7 @@ from src.agent.styles import (
 )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-ASSET_VERSION = "20260831styles2"
+ASSET_VERSION = "20260831nosuggest1"
 
 app = FastAPI(title="CodeAgent", version="0.5.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -149,35 +149,7 @@ def meta() -> dict[str, Any]:
             "ask_user": True,
             "style_cards": True,
         },
-        "suggestions": [
-            {
-                "title": "Create a script",
-                "desc": "Write hello.py and run it",
-                "prompt": "创建一个 hello.py，打印 Hello Agent，并用 python 运行它",
-            },
-            {
-                "title": "Fix greeter tests",
-                "desc": "Plan with todos, then repair",
-                "prompt": (
-                    "阅读 greeter_test.py，修复 greeter.py 使测试全部通过。"
-                    "用 todo_write 写 3～5 条阶段计划（可与读文件同轮），"
-                    "阶段完成再更新 todo；最后运行 python greeter_test.py 验证。"
-                ),
-            },
-            {
-                "title": "Learn a style card",
-                "desc": "Text or code → save_style / refine_style",
-                "prompt": (
-                    "请学习 greeter.py 的代码风格，用 save_style（kind=code, confirm=true）"
-                    "保存为 id=py-greeter；只写短规则不要整文件。"
-                ),
-            },
-            {
-                "title": "Fix buggy calc",
-                "desc": "edit_file + verify",
-                "prompt": "修复 buggy_calc.py，使 add(2,3)==5，并运行 python buggy_calc.py 验证",
-            },
-        ],
+        "suggestions": [],
     }
 
 
