@@ -31,18 +31,23 @@ def main() -> None:
 
         expected = {
             "ask_user",
+            "delete_style",
             "edit_file",
             "git_diff",
             "git_status",
             "glob",
             "grep",
             "list_dir",
+            "list_styles",
             "load_skill",
+            "load_style",
             "memory_search",
             "rag_search",
             "read_file",
+            "refine_style",
             "run_shell",
             "run_tests",
+            "save_style",
             "todo_write",
             "write_file",
         }
@@ -1188,9 +1193,10 @@ def main() -> None:
         assert sess_u["turns"][-1]["context_usage"]["remaining_pct"] == 55
 
         schemas = reg.openai_tools()
-        assert len(schemas) == len(reg.names()) == 15
+        assert len(schemas) == len(reg.names()) == 20
         assert any(s["function"]["name"] == "load_skill" for s in schemas)
         assert any(s["function"]["name"] == "ask_user" for s in schemas)
+        assert any(s["function"]["name"] == "list_styles" for s in schemas)
 
         todo_out = reg.dispatch(
             "todo_write",

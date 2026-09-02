@@ -521,6 +521,9 @@ async def run_stream(body: RunRequest) -> StreamingResponse:
                 emit(event)
 
             def log(msg: str) -> None:
+                # Mirror harness logs to the server terminal (for demos / debugging).
+                # SSE still carries type=log for clients; the Web UI currently ignores it.
+                print(msg, flush=True)
                 emit({"type": "log", "text": msg})
 
             result, config, transcript_path = run_coding_task(
